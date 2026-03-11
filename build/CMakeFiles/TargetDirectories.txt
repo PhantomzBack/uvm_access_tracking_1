@@ -1,0 +1,10 @@
+/home/ravi-vm-lkp/instrumentation_approach/build/CMakeFiles/intrinsics_gen.dir
+/home/ravi-vm-lkp/instrumentation_approach/build/CMakeFiles/vt_gen.dir
+/home/ravi-vm-lkp/instrumentation_approach/build/CMakeFiles/omp_gen.dir
+/home/ravi-vm-lkp/instrumentation_approach/build/CMakeFiles/acc_gen.dir
+/home/ravi-vm-lkp/instrumentation_approach/build/CMakeFiles/ARMTargetParserTableGen.dir
+/home/ravi-vm-lkp/instrumentation_approach/build/CMakeFiles/AArch64TargetParserTableGen.dir
+/home/ravi-vm-lkp/instrumentation_approach/build/CMakeFiles/RISCVTargetParserTableGen.dir
+/home/ravi-vm-lkp/instrumentation_approach/build/CMakeFiles/UvmTrackingPass.dir
+/home/ravi-vm-lkp/instrumentation_approach/build/CMakeFiles/edit_cache.dir
+/home/ravi-vm-lkp/instrumentation_approach/build/CMakeFiles/rebuild_cache.dir
