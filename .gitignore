@@ -1,2 +1,13 @@
 *.o
 *.out
+*.bc
+*.ll
+*.s
+*.obj
+*.so
+*.dylib
+*.dll
+*.fatbin
+*.ptx
+build/**
+!build/Makefile*
