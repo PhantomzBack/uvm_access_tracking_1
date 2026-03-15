@@ -49,7 +49,7 @@ if (err == cudaSuccess) {
 
 extern __device__ int mark_access_invoked;
 
-extern "C" void check_invocation() {
+/*extern "C" void check_invocation() {
     int host_flag = 0;
 
     cudaMemcpyFromSymbol(&host_flag, "mark_access_invoked",
@@ -59,7 +59,7 @@ extern "C" void check_invocation() {
         printf("MarkAccess WAS invoked\n");
     else
         printf("MarkAccess was NOT invoked\n");
-}
+}*/
 extern "C" void init_tracking(void*** d_l1_ptr) {
     // 1. Increase the internal GPU heap size (e.g., to 128MB or more)
     // This is required for dynamic 'malloc' in kernels to work.

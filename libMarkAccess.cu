@@ -14,7 +14,6 @@ extern "C" {
 
 
     __device__ void MarkAccess(uintptr_t addr) {
-        asm("trap");
         mark_access_invoked = 1;
         printf("In MarkAccess\n");
         if (!shadow_cr3) return;
