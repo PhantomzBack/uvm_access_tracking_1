@@ -248,6 +248,16 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
     }*/
 
 PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
+    printf("[UvmPass] Starting UVM tracking pass in source file %s\n", M.getSourceFileName().c_str());
+    if (M.getTargetTriple().find("nvptx") == std::string::npos)
+        return PreservedAnalyses::all();
+    printf("[UvmPass] Running on target triple: '%s'\n", M.getTargetTriple().c_str());
+
+    if (M.getSourceFileName().find("libMarkAccess") != std::string::npos){
+        printf("[UvmPass] Skipping module '%s'\n", M.getSourceFileName().c_str());
+        return PreservedAnalyses::all();
+    }
+    printf("[UvmPass] Running on module: '%s'\n", M.getSourceFileName().c_str());
     auto &Ctx = M.getContext();
     FunctionCallee MarkFunc = M.getOrInsertFunction("MarkAccess", Type::getVoidTy(Ctx), Type::getInt64Ty(Ctx));
     GlobalVariable *CacheVar = M.getGlobalVariable("last_page_cache");
@@ -262,6 +272,10 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
     // 1. PHASE ONE: Collect instructions to instrument
     std::vector<Instruction*> Targets;
     for (auto &F : M) {
+        if (!F.hasFnAttribute("target-features"))
+            continue;
+        if (!F.getFnAttribute("target-features").getValueAsString().contains("ptx"))
+            continue;
         if (F.isDeclaration() || F.getName().contains("MarkAccess")) continue;
 
         for (auto &BB : F) {
@@ -366,17 +380,29 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
 };
 
 // 2. Simplified Registration Logic
+// extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
+//     return {
+//         LLVM_PLUGIN_API_VERSION, "UvmTrackingPass", LLVM_VERSION_STRING,
+//         [](PassBuilder &PB) {
+//             PB.registerPipelineParsingCallback(
+//                 [](StringRef Name, ModulePassManager &MPM, ArrayRef<PassBuilder::PipelineElement>) {
+//                     if (1) {
+//                         MPM.addPass(UvmTrackingPass());
+//                         return true;
+//                     }
+//                     return false;
+//                 });
+//         }
+//     };
+// }
+
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
     return {
         LLVM_PLUGIN_API_VERSION, "UvmTrackingPass", LLVM_VERSION_STRING,
         [](PassBuilder &PB) {
-            PB.registerPipelineParsingCallback(
-                [](StringRef Name, ModulePassManager &MPM, ArrayRef<PassBuilder::PipelineElement>) {
-                    if (Name == "uvm-track") {
-                        MPM.addPass(UvmTrackingPass());
-                        return true;
-                    }
-                    return false;
+            PB.registerOptimizerLastEPCallback(
+                [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase) {
+                    MPM.addPass(UvmTrackingPass());
                 });
         }
     };

@@ -20,7 +20,7 @@ __global__ void stride_access(int* data, int n)
     if (tid < n) {
         data[tid * 1024] = tid;
         LOG("[stride_access] tid=%d accessed data[%d]\n", tid, tid * 1024);
-        MarkAccess((uintptr_t)(&data[tid * 1024]));
+        // MarkAccess((uintptr_t)(&data[tid * 1024]));
     }
     printf("[stride_access] tid=%d done\n", tid);
 }

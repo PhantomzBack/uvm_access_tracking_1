@@ -3,7 +3,7 @@
 // ── Device globals ────────────────────────────────────────────────────────────
 extern "C" {
     // shadow_l1 points to the L1 table (array of 512 void** pointers)
-    __managed__ void*** shadow_l1 = nullptr;
+    __device__ void*** shadow_l1 = nullptr;
     __device__ unsigned long long last_page_cache = 0;
 
 
@@ -130,14 +130,14 @@ extern "C" {
             printf("[check_shadow_l1] shadow_l1 is not initialised\n");
         }
     }
-    __global__ void check_shadow_l1_kernel(void)
-    {
-        if (shadow_l1) {
-            printf("[check_shadow_l1_kernel] shadow_l1 is %p\n", shadow_l1);
-        } else {
-            printf("[check_shadow_l1_kernel] shadow_l1 is not initialised\n");
-        }
-    }
+    // __global__ void check_shadow_l1_kernel(void)
+    // {
+    //     if (shadow_l1) {
+    //         printf("[check_shadow_l1_kernel] shadow_l1 is %p\n", shadow_l1);
+    //     } else {
+    //         printf("[check_shadow_l1_kernel] shadow_l1 is not initialised\n");
+    //     }
+    // }
 }
 
 
@@ -151,6 +151,8 @@ void init_tracking(void**** d_l1_ptr)
     CUDA_CHECK(cudaMemset(*d_l1_ptr, 0, L1_ENTRIES * sizeof(void**)));
 
     void*** temp = *d_l1_ptr;
+    // shadow_l1 = temp; // Direct assignment to managed variable
+// #ifdef MEMCOPY_METHOD
     CUDA_CHECK(cudaMemcpyToSymbol(shadow_l1, &temp, sizeof(void***)));
     printf("[init_tracking] shadow_l1 set to %p\n", temp);
     void*** readback = nullptr;
@@ -163,8 +165,9 @@ void init_tracking(void**** d_l1_ptr)
     } else {
         printf("[init_tracking] shadow_l1 readback successful\n");
     }
+// #endif
     //MarkAccess(0); // Touch the device to ensure shadow_l1 is visible on the GPU
-    check_shadow_l1_kernel<<<1,1>>>();
+    // check_shadow_l1_kernel<<<1,1>>>();
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
@@ -238,7 +241,7 @@ void export_log(void*** d_l1, const char* filename)
 void export_binary(void*** d_l1, const char* filename)
 {
     LOG("[export_binary] starting export\n");
-    check_shadow_l1_kernel<<<1,1>>>();
+    // check_shadow_l1_kernel<<<1,1>>>();
     CUDA_CHECK(cudaDeviceSynchronize());
     printf("[export_binary] writing to %s\n", filename);
 
