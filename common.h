@@ -10,7 +10,11 @@
 // ── Common definitions and utilities ───────────────────────────────────────────
 #define DBG printf("At line: %d\n", __LINE__);
 #define DBG_RET(ret) printf("At line: %d, returning %d\n", __LINE__, ret); return ret;
-#define LOG printf
+#ifdef DEBUG
+    #define LOG(...) printf(__VA_ARGS__)
+#else
+    #define LOG(...) ((void)0)
+#endif
 
 
 // ── Address decomposition (48-bit VA, 2-level + bitmap) ──────────────────────

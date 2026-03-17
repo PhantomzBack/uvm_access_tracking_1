@@ -10,7 +10,5 @@ void export_binary(void*** d_l1, const char* filename); // function to export th
 extern "C" __device__ void*** shadow_l1;
     // extern __device__ void*** shadow_l1; // device pointer to the L1 page table (array of pointers to L2 tables)
 extern "C" __device__ void MarkAccess(uintptr_t addr); 
-extern "C" __device__ void check_shadow_l1(void);
-// extern "C" __global__ void check_shadow_l1_kernel(void);
 
 //#endif

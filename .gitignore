@@ -10,4 +10,4 @@
 *.fatbin
 *.ptx
 build/**
-!build/Makefile*
+!build/Makefile_Main

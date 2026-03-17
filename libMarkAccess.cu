@@ -16,10 +16,7 @@ extern "C" {
             printf("[MarkAccess] shadow_l1 not initialised %p\n", shadow_l1);
             return;
         }
-        else{
-            printf("[MarkAccess] shadow_l1 is %p\n", shadow_l1);
-          //  return;
-        }
+        
 
         // Decompose address
         uint32_t l1_idx    = (addr >> L1_SHIFT) & L1_MASK;
@@ -27,7 +24,7 @@ extern "C" {
         uint32_t l3_offset = (addr >> L3_SHIFT) & L3_MASK; // bit index within L3 leaf
 
         if (addr % (1 << 20) == 0) // Throttle printf spam
-            printf("[MarkAccess] addr=%p  l1=%u l2=%u l3=%u\n",
+            LOG("[MarkAccess] addr=%p  l1=%u l2=%u l3=%u\n",
                    (void*)addr, l1_idx, l2_idx, l3_offset);
 
         LOG("[MarkAccess] addr=%p  l1=%u l2=%u l3=%u\n",
@@ -121,23 +118,6 @@ extern "C" {
             printf("[copy_l2_to_host] successful\n");
 
     }
-    __device__ void check_shadow_l1(void)
-    {
-        if (shadow_l1) {
-            printf("[check_shadow_l1] shadow_l1 is %p\n", shadow_l1);
-            MarkAccess(0); // Touch the device to ensure shadow_l1 is visible on the GPU
-        } else {
-            printf("[check_shadow_l1] shadow_l1 is not initialised\n");
-        }
-    }
-    // __global__ void check_shadow_l1_kernel(void)
-    // {
-    //     if (shadow_l1) {
-    //         printf("[check_shadow_l1_kernel] shadow_l1 is %p\n", shadow_l1);
-    //     } else {
-    //         printf("[check_shadow_l1_kernel] shadow_l1 is not initialised\n");
-    //     }
-    // }
 }
 
 
@@ -151,8 +131,6 @@ void init_tracking(void**** d_l1_ptr)
     CUDA_CHECK(cudaMemset(*d_l1_ptr, 0, L1_ENTRIES * sizeof(void**)));
 
     void*** temp = *d_l1_ptr;
-    // shadow_l1 = temp; // Direct assignment to managed variable
-// #ifdef MEMCOPY_METHOD
     CUDA_CHECK(cudaMemcpyToSymbol(shadow_l1, &temp, sizeof(void***)));
     printf("[init_tracking] shadow_l1 set to %p\n", temp);
     void*** readback = nullptr;
@@ -165,9 +143,7 @@ void init_tracking(void**** d_l1_ptr)
     } else {
         printf("[init_tracking] shadow_l1 readback successful\n");
     }
-// #endif
-    //MarkAccess(0); // Touch the device to ensure shadow_l1 is visible on the GPU
-    // check_shadow_l1_kernel<<<1,1>>>();
+
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
