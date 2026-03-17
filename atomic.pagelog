@@ -1,0 +1,104 @@
+=== CLEAN COMPILATION ===
+STDOUT:
+
+STDERR:
+
+
+=== TRACKED COMPILATION ===
+STDOUT:
+[UvmPass] Starting UVM tracking pass in source file test_kernel_1.cu
+[UvmPass] Running on target triple: 'nvptx64-nvidia-cuda'
+[UvmPass] Running on module: 'test_kernel_1.cu'
+[UvmPass] Starting UVM tracking pass in source file test_kernel_1.cu
+[UvmPass] Starting UVM tracking pass in source file ./libMarkAccess.cu
+[UvmPass] Running on target triple: 'nvptx64-nvidia-cuda'
+[UvmPass] Skipping module './libMarkAccess.cu'
+[UvmPass] Starting UVM tracking pass in source file ./libMarkAccess.cu
+
+STDERR:
+[UvmPass] Found 65 target instructions.
+   [+] Instrumented:   store ptr %0, ptr %3, align 8
+   [+] Instrumented:   store i32 %1, ptr %4, align 4
+   [+] Instrumented:   store i32 %22, ptr %5, align 4
+   [+] Instrumented:   %35 = load i32, ptr %5, align 4
+   [+] Instrumented:   %42 = load i32, ptr %4, align 4
+   [+] Instrumented:   %51 = load i32, ptr %5, align 4
+   [+] Instrumented:   %58 = load ptr, ptr %3, align 8
+   [+] Instrumented:   %65 = load i32, ptr %5, align 4
+   [+] Instrumented:   store i32 %51, ptr %67, align 4
+   [+] Instrumented:   store ptr %0, ptr %4, align 8
+   [+] Instrumented:   store i32 %1, ptr %5, align 4
+   [+] Instrumented:   store i32 %2, ptr %6, align 4
+   [+] Instrumented:   store i32 %30, ptr %7, align 4
+   [+] Instrumented:   %43 = load i32, ptr %7, align 4
+   [+] Instrumented:   %50 = load i32, ptr %5, align 4
+   [+] Instrumented:   %59 = load i32, ptr %7, align 4
+   [+] Instrumented:   %66 = load ptr, ptr %4, align 8
+   [+] Instrumented:   %73 = load i32, ptr %7, align 4
+   [+] Instrumented:   %80 = load i32, ptr %6, align 4
+   [+] Instrumented:   store i32 %59, ptr %83, align 4
+   [+] Instrumented:   store ptr %0, ptr %4, align 8
+   [+] Instrumented:   store ptr %1, ptr %5, align 8
+   [+] Instrumented:   store i32 %2, ptr %6, align 4
+   [+] Instrumented:   store i32 %30, ptr %7, align 4
+   [+] Instrumented:   %43 = load i32, ptr %7, align 4
+   [+] Instrumented:   %50 = load i32, ptr %6, align 4
+   [+] Instrumented:   %59 = load i32, ptr %7, align 4
+   [+] Instrumented:   %66 = load ptr, ptr %4, align 8
+   [+] Instrumented:   %73 = load ptr, ptr %5, align 8
+   [+] Instrumented:   %80 = load i32, ptr %7, align 4
+   [+] Instrumented:   %89 = load i32, ptr %82, align 4
+   [+] Instrumented:   store i32 %59, ptr %91, align 4
+   [+] Instrumented:   store ptr %0, ptr %4, align 8
+   [+] Instrumented:   store ptr %1, ptr %5, align 8
+   [+] Instrumented:   store i32 %2, ptr %6, align 4
+   [+] Instrumented:   store i32 %30, ptr %7, align 4
+   [+] Instrumented:   %43 = load i32, ptr %7, align 4
+   [+] Instrumented:   %52 = load i32, ptr %7, align 4
+   [+] Instrumented:   %59 = load i32, ptr %6, align 4
+   [+] Instrumented:   %69 = load ptr, ptr %4, align 8
+   [+] Instrumented:   %76 = load i32, ptr %7, align 4
+   [+] Instrumented:   %86 = load i32, ptr %79, align 4
+   [+] Instrumented:   %93 = load ptr, ptr %4, align 8
+   [+] Instrumented:   %100 = load i32, ptr %7, align 4
+   [+] Instrumented:   %109 = load i32, ptr %102, align 4
+   [+] Instrumented:   %117 = load ptr, ptr %4, align 8
+   [+] Instrumented:   %124 = load i32, ptr %7, align 4
+   [+] Instrumented:   %134 = load i32, ptr %127, align 4
+   [+] Instrumented:   %143 = load ptr, ptr %5, align 8
+   [+] Instrumented:   %150 = load i32, ptr %7, align 4
+   [+] Instrumented:   store i32 %136, ptr %152, align 4
+   [+] Instrumented:   store ptr %0, ptr %3, align 8
+   [+] Instrumented:   store i32 %1, ptr %4, align 4
+   [+] Instrumented:   store i32 %22, ptr %5, align 4
+   [+] Instrumented:   %35 = load i32, ptr %5, align 4
+   [+] Instrumented:   %42 = load i32, ptr %4, align 4
+   [+] Instrumented:   %51 = load ptr, ptr %3, align 8
+   [+] Instrumented:   store ptr %0, ptr %5, align 8
+   [+] Instrumented:   store i32 %1, ptr %6, align 4
+   [+] Instrumented:   %25 = load ptr, ptr %5, align 8
+   [+] Instrumented:   %32 = load i32, ptr %6, align 4
+   [+] Instrumented:   store ptr %25, ptr %3, align 8
+   [+] Instrumented:   store i32 %32, ptr %4, align 4
+   [+] Instrumented:   %51 = load ptr, ptr %3, align 8
+   [+] Instrumented:   %58 = load i32, ptr %4, align 4
+
+
+=== CLEAN RUN OUTPUT ===
+BENCHMARK_TIME: 1.18579
+
+
+
+=== TRACKED RUN OUTPUT ===
+[init_tracking] shadow_l1 set to 0x7e71a2600000
+[init_tracking] shadow_l1 → 0x7e71a2600000 (readback 0x7e71a2600000)
+[init_tracking] shadow_l1 readback successful
+BENCHMARK_TIME: 0.953344
+[export_binary] writing to access_log.bin
+[copy_l2_to_host] successful
+[copy_l2_to_host] successful
+[export_binary] 1 populated leaves
+[export_binary] done — 4140 bytes written
+
+
+
