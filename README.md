@@ -29,8 +29,29 @@ cd build
 cmake .. -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm
 make
 ```
+## 2. Required API Calls in Your CUDA Program
 
-### 2. Instrument a CUDA Program
+Before running any tracked kernel, you must add three function calls to your host code:
+```cpp
+// 1. Initialize the tracking structure on the device
+init_tracking(&d_l1);
+
+// --- your kernel launches here ---
+
+// 2. Export the log as human-readable text (for debugging/inspection)
+export_log(d_l1, "access_log.txt");
+
+// 3. Export the log as binary (required for the visualization dashboard)
+export_binary(d_l1, "access_log.bin");
+```
+
+> **`init_tracking`** - Allocates and initializes the device-side access log structure before any kernel runs.
+>
+> **`export_log`** - Copies the log from device memory to the host and writes it as a human-readable text file. Useful for quick inspection and debugging.
+>
+> **`export_binary`** - Writes the same log in a compact raw binary format. This is the file consumed by `pagelog_drill.py` - the visualization dashboard **will not work** without this.
+
+### 3. Instrument a CUDA Program
 
 Compile your CUDA source with the instrumentation pass injected via `-fpass-plugin`:
 ```bash
@@ -46,7 +67,7 @@ clang++-20 -x cuda \
 
 > **Note:** The GPU architecture (`sm_XX`) is detected automatically at compile time using `nvidia-smi`.
 
-### 3. Run the Instrumented Binary
+### 4. Run the Instrumented Binary
 ```bash
 ./my_program
 ```
