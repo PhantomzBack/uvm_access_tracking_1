@@ -3,11 +3,13 @@ CLANG = clang++-20
 OPT = opt-20
 LLVM_LINK = llvm-link-20
 LLC = llc-20
-ARCH = sm_89
+ARCH = sm_86
 CUDA_PATH = /usr/local/cuda
 
 # Include paths
-INCLUDES = -I$(CUDA_PATH)/include -I/usr/include/x86_64-linux-gnu
+INCLUDES = -I$(CUDA_PATH)/include -I/usr/include/x86_64-linux-gnu -I/usr/include/c++/11 \
+        -I/usr/include/x86_64-linux-gnu/c++/11 \
+
 
 # Build Targets
 all: uvm_tracker_bin uvm_tracker_bin_old
@@ -19,7 +21,8 @@ kernel.ll: ../test_kernel.cu
 # 2. Compile MarkAccess Library to Bitcode
 libMarkAccess.bc: ../libMarkAccess.cu
 	$(CLANG) -target nvptx64-nvidia-cuda --cuda-gpu-arch=$(ARCH) --cuda-path=$(CUDA_PATH) -g -O0 \
-	-D__x86_64__ --cuda-device-only -emit-llvm -fno-builtin -c $< -o $@
+	-D__x86_64__ --cuda-device-only -emit-llvm -fno-builtin $(INCLUDES) \
+	-c $< -o $@
 
 # 3. Instrument the Kernel IR using the Pass
 # Note: This assumes UvmTrackingPass.so is already built via CMake
@@ -60,18 +63,19 @@ uvm_tracker_bin_old: ../test_kernel.cu host_runtime.o final.ptx
 
 test_kernel_host.o: ../test_kernel.cu
 	$(CLANG) \
-	--cuda-gpu-arch=$(ARCH) \
+	--cuda-host-only \
 	-fcuda-rdc \
 	-g -O0 \
 	-c $< -o $@ $(INCLUDES)
 
-uvm_tracker_bin: cuda_link_stub.cu test_kernel_host.o host_runtime.o final.ptx
-	$(CLANG) cuda_link_stub.cu test_kernel_host.o host_runtime.o \
-	--cuda-gpu-arch=$(ARCH) \
-	-fcuda-rdc \
-	-g -O0 \
-	-L$(CUDA_PATH)/lib64 -lcudart \
-	-o $@
+#uvm_tracker_bin: cuda_link_stub.cu test_kernel_host.o host_runtime.o final.ptx
+#	$(CLANG) cuda_link_stub.cu test_kernel_host.o host_runtime.o \
+#	--cuda-gpu-arch=$(ARCH) \
+#	-fcuda-rdc \
+#	-g -O0 \
+#	-L$(CUDA_PATH)/lib64 -lcudart \
+#	-Xoffload-linker -T -Xoffload-linker final.ptx \
+#	-o $@
 
 #test_kernel_host.o: ../test_kernel.cu
 #	$(CLANG) --cuda-host-only -c $< -o $@ $(INCLUDES)
@@ -83,13 +87,13 @@ uvm_tracker_bin: cuda_link_stub.cu test_kernel_host.o host_runtime.o final.ptx
 #	-Xoffload-linker --pme-id=0 \
 #	-Xoffload-linker -T -Xoffload-linker final.ptx \
 #	-o $@
-#uvm_tracker_bin: test_kernel_host.o host_runtime.o final.ptx
-#	$(CLANG) test_kernel_host.o host_runtime.o \
-#	--cuda-gpu-arch=$(ARCH) \
-#	-L$(CUDA_PATH)/lib64 -lcudart \
-#	-Xoffload-linker --pme-id=0 \
-#	-Xoffload-linker -T -Xoffload-linker final.ptx \
-#	-o $@
+uvm_tracker_bin: test_kernel_host.o host_runtime.o final.ptx
+	$(CLANG) test_kernel_host.o host_runtime.o \
+	--cuda-gpu-arch=$(ARCH) \
+	-L$(CUDA_PATH)/lib64 -lcudart \
+	-Xoffload-linker --pme-id=0 \
+	-Xoffload-linker -T -Xoffload-linker final.ptx \
+	-o $@
 
 
 
