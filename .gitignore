@@ -9,5 +9,7 @@
 *.dll
 *.fatbin
 *.ptx
+*cscope*
+*tags*
 build/**
 !build/Makefile_Main

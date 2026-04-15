@@ -11,7 +11,6 @@ extern "C" {
     __device__ void MarkAccess(uintptr_t addr)
     {
         LOG("[MarkAccess] called with addr=%p\n", (void*)addr);
-        // return; // TEMP: disable tracking for now
         if (!shadow_l1) {
             printf("[MarkAccess] shadow_l1 not initialised %p\n", shadow_l1);
             return;

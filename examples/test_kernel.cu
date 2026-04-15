@@ -20,6 +20,10 @@ __global__ void stride_access(int* data, int n)
         data[tid * 1024] = tid;
         printf("[stride_access] tid=%d accessed data[%d]\n", tid, tid * 1024);       
     }
+    for (int i = 0; i < n; i++) {
+        data[tid * 1024 + i] = tid + i;
+        printf("[stride_access] tid=%d accessed data[%d]\n", tid, tid * 1024 + i);       
+    }
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
