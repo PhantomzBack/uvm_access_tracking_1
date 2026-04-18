@@ -5,7 +5,6 @@
 #include <random>
 #include "tracking.h"
 
-#define TRACKING_ENABLED
 
 #define CUDA_CHECK(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true) {
