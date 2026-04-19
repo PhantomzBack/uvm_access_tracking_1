@@ -3,6 +3,8 @@ project(UvmTracker)
 
 # Force use of LLVM 20
 set(LLVM_DIR /usr/lib/llvm-20/lib/cmake/llvm)
+set(CMAKE_CXX_COMPILER "clang++-20")
+set(CMAKE_C_COMPILER "clang-20")
 
 # 1. Find the pre-installed LLVM
 find_package(LLVM REQUIRED CONFIG)

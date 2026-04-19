@@ -7,7 +7,7 @@
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/IR/Constants.h"
-#include <llvm-14/llvm/Support/raw_ostream.h>
+#include <llvm-20/llvm/Support/raw_ostream.h>
 
 static constexpr uint64_t PAGE_SHIFT = 12;
 static constexpr uint64_t PAGE_SIZE  = (1ULL << PAGE_SHIFT); // 4096
