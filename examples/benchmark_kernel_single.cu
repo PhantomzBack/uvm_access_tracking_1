@@ -24,7 +24,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 // 2. Stride: Forces multiple cache line fetches
 __global__ void test_stride(int* data, int n, int mem_stride) {
     int grid_stride = blockDim.x * gridDim.x;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += grid_stride) {
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += grid_stride) {
         // We use 'i' as the logic index and 'mem_stride' for the memory gap
         data[i * mem_stride] = i;
     }

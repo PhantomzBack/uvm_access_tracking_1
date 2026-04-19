@@ -5,6 +5,8 @@ GPU_ARCH="sm_89"
 CUDA_PATH="/usr/local/cuda"
 CLANG="clang++-20"
 PLUGIN="./build/UvmTrackingPass.so"
+ADDITIONAL_FLAGS="-fgpu-rdc -g -O2"
+INCLUDE_DIR="-I./include"
 LIB_SRC="./libMarkAccess.cu"
 TARGET_FILE="../examples/benchmark_kernel_single.cu"
 
@@ -23,7 +25,7 @@ if [[ "$*" == *"--run"* ]]; then
 fi
 
 # 1. Copy the provided file to the target location
-cp "$SOURCE_INPUT" "$TARGET_FILE"
+# cp "$SOURCE_INPUT" "$TARGET_FILE"
 
 # Extract base name for executable naming
 FILENAME=$(basename -- "$SOURCE_INPUT")
@@ -37,10 +39,11 @@ echo "--- Compiling $FILENAME ---"
 # 2. Compile Instrumented Version
 # Includes: -DTRACKING_ENABLED, the compiler pass, and the helper library
 $CLANG -x cuda --cuda-gpu-arch=$GPU_ARCH \
-    -fgpu-rdc -I../ -g \
+    $ADDITIONAL_FLAGS \
+    $INCLUDE_DIR\
     -DTRACKING_ENABLED \
     -fpass-plugin=$PLUGIN \
-    "$TARGET_FILE" "$LIB_SRC" \
+    "$SOURCE_INPUT" "$LIB_SRC" \
     --cuda-path=$CUDA_PATH -L$CUDA_PATH/lib64 \
     -lcudart -o "$EXE_INSTRUMENTED"
 
@@ -54,8 +57,9 @@ fi
 # 3. Compile Normal Version
 # Excludes: compiler pass and libMarkAccess
 $CLANG -x cuda --cuda-gpu-arch=$GPU_ARCH \
-    -fgpu-rdc -I../ -g \
-    "$TARGET_FILE" \
+    $ADDITIONAL_FLAGS \
+    $INCLUDE_DIR \
+    "$SOURCE_INPUT" \
     --cuda-path=$CUDA_PATH -L$CUDA_PATH/lib64 \
     -lcudart -o "$EXE_NORMAL"
 

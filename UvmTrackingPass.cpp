@@ -47,7 +47,7 @@ PageInvarianceResult checkPageInvariance(
     // ── Case 2: Affine recurrence {base, +, stride}_L ──
     auto *AR = llvm::dyn_cast<llvm::SCEVAddRecExpr>(PtrSCEV);
     if (!AR || AR->getLoop() != L || !AR->isAffine()){
-        llvm::errs() << "[UvmPass] Non-affine or non-additive SCEV for pointer: " << *PtrSCEV << "\n";
+        //llvm::errs() << "[UvmPass] Non-affine or non-additive SCEV for pointer: " << *PtrSCEV << "\n";
         return { PageInvariance::Unknown };
     }
 
@@ -417,7 +417,7 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
             errs() << "   [+] Instrumented: " << *Inst << "\n";
         }
     }
-
+    errs() << "[UvmPass] Finished processing module: " << M.getSourceFileName() << "\n";
     return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 };
