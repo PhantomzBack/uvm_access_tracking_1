@@ -12,7 +12,7 @@ extern "C" {
     {
         LOG("[MarkAccess] called with addr=%p\n", (void*)addr);
         if (!shadow_l1) {
-            printf("[MarkAccess] shadow_l1 not initialised %p\n", shadow_l1);
+            LOG("[MarkAccess] shadow_l1 not initialised %p\n", shadow_l1);
             return;
         }
         
@@ -93,8 +93,71 @@ extern "C" {
             LOG("[MarkAccess] after atomicOr, bit is now %lld\n",
                 ((*word) >> (l3_offset % 64)) & 1ULL);
         } else {
-            printf("[MarkAccess] error: L3 bitmap not allocated for L1 index %u, L2 index %u\n",
+            LOG("[MarkAccess] error: L3 bitmap not allocated for L1 index %u, L2 index %u\n",
                    l1_idx, l2_idx);
+        }
+    }
+
+    // ── BatchMarkAccess ───────────────────────────────────────────────────────
+    // Optimised for affine recurrences: caches the resolved L2 and L3 pointers
+    // across iterations so we pay the tree-traversal cost at most once per
+    // unique (l1_idx, l2_idx) pair instead of once per iteration.
+    __device__ void BatchMarkAccess(uintptr_t base_addr, int64_t stride, uint64_t count)
+    {
+        if (!shadow_l1 || count == 0) return;
+
+        // Thread-local pointer cache (lives in registers for this call).
+        uint32_t            cached_l1 = (uint32_t)-1;
+        uint32_t            cached_l2 = (uint32_t)-1;
+        void**              l2_table  = nullptr;
+        unsigned long long* l3_bitmap = nullptr;
+
+        for (uint64_t i = 0; i < count; i++) {
+            uintptr_t addr = (uintptr_t)((intptr_t)base_addr + (int64_t)i * stride);
+
+            uint32_t l1_idx    = (uint32_t)((addr >> L1_SHIFT) & L1_MASK);
+            uint32_t l2_idx    = (uint32_t)((addr >> L2_SHIFT) & L2_MASK);
+            uint32_t l3_offset = (uint32_t)((addr >> L3_SHIFT) & L3_MASK);
+
+            // ── L1 cache: demand-allocate L2 table on miss ────────────────────
+            if (l1_idx != cached_l1) {
+                if (!shadow_l1[l1_idx]) {
+                    void** new_l2 = (void**)malloc(L2_ENTRIES * sizeof(void*));
+                    if (!new_l2) continue;
+                    unsigned long long old = atomicCAS(
+                        (unsigned long long*)&shadow_l1[l1_idx],
+                        0ULL, (unsigned long long)new_l2);
+                    if (old != 0ULL) free(new_l2);
+                    else             memset(new_l2, 0, L2_ENTRIES * sizeof(void*));
+                }
+                l2_table  = (void**)shadow_l1[l1_idx];
+                cached_l1 = l1_idx;
+                cached_l2 = (uint32_t)-1;  // L2 index stale after L1 miss
+                l3_bitmap = nullptr;
+            }
+
+            // ── L2 cache: demand-allocate L3 leaf on miss ─────────────────────
+            if (l2_idx != cached_l2) {
+                if (!l2_table[l2_idx]) {
+                    void* new_l3 = malloc(L3_BYTES);
+                    if (!new_l3) continue;
+                    unsigned long long old = atomicCAS(
+                        (unsigned long long*)&l2_table[l2_idx],
+                        0ULL, (unsigned long long)new_l3);
+                    if (old != 0ULL) free(new_l3);
+                    else             memset(new_l3, 0, L3_BYTES);
+                }
+                l3_bitmap = (unsigned long long*)l2_table[l2_idx];
+                cached_l2 = l2_idx;
+            }
+
+            // ── L3: mark the bit; skip atomicOr when already set ──────────────
+            if (l3_bitmap) {
+                unsigned long long* word = &l3_bitmap[l3_offset / 64];
+                unsigned long long  mask = 1ULL << (l3_offset % 64);
+                if (!(*word & mask))   // non-atomic pre-check avoids redundant atomics
+                    atomicOr(word, mask);
+            }
         }
     }
 
@@ -104,7 +167,7 @@ extern "C" {
         if (tid < n)
             out[tid] = ((void**)l1[l1_idx])[tid];
         if (tid == n-1)
-            printf("[copy_l2_to_host] successful\n");
+            LOG("[copy_l2_to_host] successful\n");
     }
 
     __global__ void copy_l3_to_host(void*** l1, int l1_idx, int l2_idx,
@@ -114,7 +177,7 @@ extern "C" {
         if (tid < n)
             out[tid] = ((unsigned long long*)((void**)l1[l1_idx])[l2_idx])[tid];
         if (tid == n-1)
-            printf("[copy_l2_to_host] successful\n");
+            LOG("[copy_l2_to_host] successful\n");
 
     }
 }
@@ -131,16 +194,16 @@ void init_tracking(void**** d_l1_ptr)
 
     void*** temp = *d_l1_ptr;
     CUDA_CHECK(cudaMemcpyToSymbol(shadow_l1, &temp, sizeof(void***)));
-    printf("[init_tracking] shadow_l1 set to %p\n", temp);
+    LOG("[init_tracking] shadow_l1 set to %p\n", temp);
     void*** readback = nullptr;
     CUDA_CHECK(cudaMemcpyFromSymbol(&readback, shadow_l1, sizeof(void***)));
-    printf("[init_tracking] shadow_l1 → %p (readback %p)\n", temp, readback);
+    LOG("[init_tracking] shadow_l1 → %p (readback %p)\n", temp, readback);
 
     if(temp != readback) {
         fprintf(stderr, "[init_tracking] error: shadow_l1 readback mismatch!\n");
         exit(1);
     } else {
-        printf("[init_tracking] shadow_l1 readback successful\n");
+        LOG("[init_tracking] shadow_l1 readback successful\n");
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -150,7 +213,7 @@ void init_tracking(void**** d_l1_ptr)
 void export_log(void*** d_l1, const char* filename)
 {
     std::ofstream f(filename);
-    printf("[export_log] writing to %s\n", filename);
+    LOG("[export_log] writing to %s\n", filename);
 
     std::vector<void**> h_l1(L1_ENTRIES);
     CUDA_CHECK(cudaMemcpy(h_l1.data(), d_l1,
@@ -218,7 +281,7 @@ void export_binary(void*** d_l1, const char* filename)
     LOG("[export_binary] starting export\n");
     // check_shadow_l1_kernel<<<1,1>>>();
     CUDA_CHECK(cudaDeviceSynchronize());
-    printf("[export_binary] writing to %s\n", filename);
+    LOG("[export_binary] writing to %s\n", filename);
 
     // ── copy L1 to host ───────────────────────────────────────────────────────
     std::vector<void**> h_l1(L1_ENTRIES);
@@ -276,7 +339,7 @@ void export_binary(void*** d_l1, const char* filename)
     cudaFree(d_l2_stage);
     cudaFree(d_l3_stage);
 
-    printf("[export_binary] %zu populated leaves\n", leaves.size());
+    LOG("[export_binary] %zu populated leaves\n", leaves.size());
 
     // ── write file ────────────────────────────────────────────────────────────
     std::ofstream f(filename, std::ios::binary);
@@ -313,5 +376,5 @@ void export_binary(void*** d_l1, const char* filename)
     for (auto& leaf : leaves)
         f.write(reinterpret_cast<char*>(leaf.data.data()), L3_BYTES);
 
-    printf("[export_binary] done — %zu bytes written\n", (size_t)off);
+    LOG("[export_binary] done — %zu bytes written\n", (size_t)off);
 }

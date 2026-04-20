@@ -21,7 +21,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 // 1. Coalesced: Ideal pattern with Grid-Stride Loop
 __global__ void test_coalesced(int* data, int n) {
     int grid_stride = blockDim.x * gridDim.x;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += grid_stride) {
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += grid_stride) {
         data[i] = i;
     }
 }
@@ -29,7 +29,7 @@ __global__ void test_coalesced(int* data, int n) {
 // 2. Stride: Forces multiple cache line fetches
 __global__ void test_stride(int* data, int n, int mem_stride) {
     int grid_stride = blockDim.x * gridDim.x;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += grid_stride) {
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += grid_stride) {
         // We use 'i' as the logic index and 'mem_stride' for the memory gap
         data[i * mem_stride] = i;
     }
@@ -38,7 +38,7 @@ __global__ void test_stride(int* data, int n, int mem_stride) {
 // 3. Random: High latency, no spatial locality
 __global__ void test_random(int* data, int* indices, int n) {
     int grid_stride = blockDim.x * gridDim.x;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += grid_stride) {
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += grid_stride) {
         data[indices[i]] = i;
     }
 }
@@ -46,7 +46,7 @@ __global__ void test_random(int* data, int* indices, int n) {
 // 4. Stencil: Reads neighbors (L1/L2 reuse)
 __global__ void test_stencil(int* in, int* out, int n) {
     int grid_stride = blockDim.x * gridDim.x;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += grid_stride) {
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += grid_stride) {
         // Boundary check remains necessary within the loop
         if (i > 0 && i < n - 1) {
             out[i] = (in[i-1] + in[i] + in[i+1]) / 3;
@@ -57,7 +57,7 @@ __global__ void test_stencil(int* in, int* out, int n) {
 // 5. Atomics: Serialization overhead
 __global__ void test_atomic(int* data, int n) {
     int grid_stride = blockDim.x * gridDim.x;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += grid_stride) {
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += grid_stride) {
         atomicAdd(&data[0], 1);
     }
 }

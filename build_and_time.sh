@@ -76,7 +76,7 @@ if [ "$RUN_BENCHMARK" = true ]; then
 
     # Function to get time in seconds using 'time'
     # We use 'format %e' to get real elapsed time
-    TIME_CMD="/usr/bin/time -f %e"
+    TIME_CMD="time -f %e"
 
     echo "Running Normal..."
     TIME_NORMAL=$($TIME_CMD ./$EXE_NORMAL 2>&1 >/dev/null)

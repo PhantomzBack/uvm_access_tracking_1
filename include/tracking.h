@@ -9,6 +9,7 @@ void export_binary(void*** d_l1, const char* filename); // function to export th
 //#ifdef __CUDACC__
 extern "C" __device__ void*** shadow_l1;
     // extern __device__ void*** shadow_l1; // device pointer to the L1 page table (array of pointers to L2 tables)
-extern "C" __device__ void MarkAccess(uintptr_t addr); 
+extern "C" __device__ void MarkAccess(uintptr_t addr);
+extern "C" __device__ void BatchMarkAccess(uintptr_t base_addr, int64_t stride, uint64_t count);
 
 //#endif

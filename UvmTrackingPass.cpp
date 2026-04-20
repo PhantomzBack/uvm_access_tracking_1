@@ -8,6 +8,7 @@
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/IR/Constants.h"
 #include <llvm-20/llvm/Support/raw_ostream.h>
+#include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 
 static constexpr uint64_t PAGE_SHIFT = 12;
 static constexpr uint64_t PAGE_SIZE  = (1ULL << PAGE_SHIFT); // 4096
@@ -60,8 +61,10 @@ PageInvarianceResult checkPageInvariance(
     llvm::errs() << "[UvmPass] Analyzing affine recurrence: " << *AR << "\n";
 
     // ── Case 2a: Stride is 0 → pointer never moves ──
-    if (StrideSCEV->isZero())
+    if (StrideSCEV->isZero()){
+        llvm::errs() << "[UvmPass] Zero stride detected: " << *StrideSCEV << "\n";
         return { PageInvariance::Invariant, StrideSCEV, TC, 0 };
+    }
 
     // ── Case 2b: Constant stride and known trip count ──
     if (auto *ConstStride = llvm::dyn_cast<llvm::SCEVConstant>(StrideSCEV)) {
@@ -88,7 +91,8 @@ PageInvarianceResult checkPageInvariance(
             return { PageInvariance::Variant, StrideSCEV, TC, totalRange };
         }
 
-        // TC unknown but stride known: conservative range check via SCEV ranges
+        // TC unknown but stride known: try page-fit via SCEV range first,
+        // then fall back to Variant so the pass can try runtime batching.
         auto Range = SE.getUnsignedRange(AR);
         if (!Range.isFullSet()) {
             uint64_t SCEVRange = (Range.getUpper() - Range.getLower())
@@ -96,17 +100,17 @@ PageInvarianceResult checkPageInvariance(
             if (SCEVRange < PAGE_SIZE)
                 return { PageInvariance::MaybeInvariant, StrideSCEV, 0, SCEVRange };
         }
+        // Constant stride, TC unknown, large range → Variant; emitBatchMarkAccess
+        // will resolve TC at compile time via getBackedgeTakenCount.
+        return { PageInvariance::Variant, StrideSCEV, 0, 0 };
     }
 
-    // ── Case 2c: Non-constant stride — use SCEV range of the full recurrence ──
-    auto Range = SE.getUnsignedRange(PtrSCEV);
-    if (!Range.isFullSet()) {
-        uint64_t span = (Range.getUpper() - Range.getLower()).getLimitedValue();
-        if (span < PAGE_SIZE)
-            return { PageInvariance::MaybeInvariant, StrideSCEV, TC, span };
-    }
-
-    return { PageInvariance::Unknown };
+    // ── Case 2c: Non-constant stride, affine recurrence ──────────────────────
+    // Stride is loop-invariant (guaranteed by isAffine() above).  Return Variant
+    // so emitBatchMarkAccess can expand both stride and TC via SCEVExpander.
+    // If SCEVExpander can't resolve them at compile time it will bail out safely.
+    llvm::errs() << "[UvmPass] Non-constant affine stride, returning Variant: " << *PtrSCEV << "\n";
+    return { PageInvariance::Variant, StrideSCEV, TC, 0 };
 }
 
 
@@ -221,6 +225,92 @@ llvm::Function *getMarkPageFn(llvm::Module &M) {
                M.getOrInsertFunction("MarkAccess", FnTy).getCallee());
 }
 
+llvm::Function *getBatchMarkAccessFn(llvm::Module &M) {
+    auto &Ctx    = M.getContext();
+    auto *I64Ty  = llvm::Type::getInt64Ty(Ctx);
+    auto *VoidTy = llvm::Type::getVoidTy(Ctx);
+    // BatchMarkAccess(base_addr: i64, stride: i64, count: i64) → void
+    auto *FnTy = llvm::FunctionType::get(VoidTy, {I64Ty, I64Ty, I64Ty}, false);
+    return llvm::cast<llvm::Function>(
+        M.getOrInsertFunction("BatchMarkAccess", FnTy).getCallee());
+}
+
+// Emit a single BatchMarkAccess(base, stride, count) call in the loop preheader.
+// Handles both compile-time-constant and runtime (loop-invariant) stride/TC by
+// expanding all three arguments via SCEVExpander.
+static void emitBatchMarkAccess(
+        llvm::Value *Ptr, llvm::Loop *L,
+        const PageInvarianceResult &Result,
+        llvm::ScalarEvolution &SE,
+        llvm::Function *BatchMarkFn,
+        const llvm::DataLayout &DL) {
+    if (!Result.stride) return;
+
+    llvm::BasicBlock *Preheader = L->getLoopPreheader();
+    if (!Preheader) return;
+
+    auto &Ctx   = Preheader->getContext();
+    auto *I64Ty = llvm::Type::getInt64Ty(Ctx);
+    auto *PtrTy = llvm::PointerType::getUnqual(Ctx);
+
+    // ── Base: start value of the pointer recurrence ───────────────────────────
+    const llvm::SCEV *PtrSCEV  = SE.getSCEV(Ptr);
+    const llvm::SCEV *BaseSCEV = PtrSCEV;
+    if (auto *AR = llvm::dyn_cast<llvm::SCEVAddRecExpr>(PtrSCEV))
+        BaseSCEV = AR->getStart();
+
+    // ── Stride: sign-extend to i64 ────────────────────────────────────────────
+    const llvm::SCEV *StrideSCEV =
+        SE.getTruncateOrSignExtend(Result.stride, I64Ty);
+
+    // ── Trip count: prefer static value, fall back to backedge SCEV + 1 ──────
+    const llvm::SCEV *CountSCEV = nullptr;
+    if (Result.tripCount > 0) {
+        CountSCEV = SE.getConstant(I64Ty, Result.tripCount);
+    } else {
+        const llvm::SCEV *BTC = SE.getBackedgeTakenCount(L);
+        if (llvm::isa<llvm::SCEVCouldNotCompute>(BTC)) {
+            llvm::errs() << "[UVM] BatchMarkAccess: trip count unresolvable for " << *PtrSCEV << "\n";
+            return;
+        }
+        // BTC is backedge-taken count = iterations - 1; add 1 for total count.
+        CountSCEV = SE.getAddExpr(
+            SE.getTruncateOrZeroExtend(BTC, I64Ty),
+            SE.getConstant(I64Ty, 1));
+    }
+
+    // ── Hoist: walk up to the outermost loop where all three are invariant ────
+    llvm::Loop *HoistTarget = L;
+    for (llvm::Loop *Parent = L->getParentLoop();
+         Parent && Parent->getLoopPreheader() &&
+         SE.isLoopInvariant(BaseSCEV,   Parent) &&
+         SE.isLoopInvariant(StrideSCEV, Parent) &&
+         SE.isLoopInvariant(CountSCEV,  Parent);
+         Parent = Parent->getParentLoop()) {
+        HoistTarget = Parent;
+    }
+
+    llvm::BasicBlock *HoistPreheader = HoistTarget->getLoopPreheader();
+    if (!HoistPreheader) return;
+
+    if (HoistTarget != L)
+        llvm::errs() << "[UVM] BatchMarkAccess hoisted depth "
+                     << L->getLoopDepth() << " → "
+                     << HoistTarget->getLoopDepth() << "\n";
+
+    // ── Expand all three SCEVs to IR values at the chosen preheader ───────────
+    llvm::SCEVExpander Expander(SE, DL, "batch.mark");
+    auto InsertIt = HoistPreheader->getTerminator()->getIterator();
+
+    llvm::Value *BasePtr   = Expander.expandCodeFor(BaseSCEV,   PtrTy,  InsertIt);
+    llvm::Value *StrideVal = Expander.expandCodeFor(StrideSCEV, I64Ty,  InsertIt);
+    llvm::Value *CountVal  = Expander.expandCodeFor(CountSCEV,  I64Ty,  InsertIt);
+
+    llvm::IRBuilder<> B(HoistPreheader->getTerminator());
+    llvm::Value *BaseInt = B.CreatePtrToInt(BasePtr, I64Ty, "batch.base");
+    B.CreateCall(BatchMarkFn, {BaseInt, StrideVal, CountVal});
+}
+
 llvm::Value *emitPageInvarianceRuntimeCheck(
         llvm::Value    *BasePtr,   // the loop-invariant base address
         uint64_t        byteRange, // stride * (TC - 1)
@@ -305,6 +395,7 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
     auto &Ctx = M.getContext();
     FunctionCallee MarkFunc = M.getOrInsertFunction(
         "MarkAccess", Type::getVoidTy(Ctx), Type::getInt64Ty(Ctx));
+    auto *BatchMarkFn = getBatchMarkAccessFn(M);
 
     GlobalVariable *CacheVar = M.getGlobalVariable("last_page_cache");
     if (!CacheVar) {
@@ -389,15 +480,14 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
                                             cast<Function>(MarkFunc.getCallee()));
                     continue;
                 }
-                if (Result.kind == PageInvariance::Variant && isPageAlignedStride(Result.stride)) {
-                    errs() << "[UVM] Page-variant with page-aligned stride: stride=" 
-                           << *Result.stride << " TC=" << Result.tripCount << "\n";
-                    hoistBatchMarkPages(Ptr, L, Result,
-                                       cast<Function>(MarkFunc.getCallee()));
+                if (Result.kind == PageInvariance::Variant && Result.stride) {
+                    errs() << "[UVM] BatchMarkAccess: stride=" << *Result.stride
+                           << " TC=" << Result.tripCount << "\n";
+                    emitBatchMarkAccess(Ptr, L, Result, SE, BatchMarkFn,
+                                       M.getDataLayout());
                     continue;
                 }
-                // else: Unknown or non-hoistable Variant → fall through to
-                // per-instruction instrumentation below
+                // Unknown → per-instruction fallback
             } 
 
 
