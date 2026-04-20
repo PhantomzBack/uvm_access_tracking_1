@@ -238,16 +238,16 @@ llvm::Function *getBatchMarkAccessFn(llvm::Module &M) {
 // Emit a single BatchMarkAccess(base, stride, count) call in the loop preheader.
 // Handles both compile-time-constant and runtime (loop-invariant) stride/TC by
 // expanding all three arguments via SCEVExpander.
-static void emitBatchMarkAccess(
+static bool emitBatchMarkAccess(
         llvm::Value *Ptr, llvm::Loop *L,
         const PageInvarianceResult &Result,
         llvm::ScalarEvolution &SE,
         llvm::Function *BatchMarkFn,
         const llvm::DataLayout &DL) {
-    if (!Result.stride) return;
+    if (!Result.stride) return false;
 
     llvm::BasicBlock *Preheader = L->getLoopPreheader();
-    if (!Preheader) return;
+    if (!Preheader) return false;
 
     auto &Ctx   = Preheader->getContext();
     auto *I64Ty = llvm::Type::getInt64Ty(Ctx);
@@ -271,7 +271,7 @@ static void emitBatchMarkAccess(
         const llvm::SCEV *BTC = SE.getBackedgeTakenCount(L);
         if (llvm::isa<llvm::SCEVCouldNotCompute>(BTC)) {
             llvm::errs() << "[UVM] BatchMarkAccess: trip count unresolvable for " << *PtrSCEV << "\n";
-            return;
+            return false;
         }
         // BTC is backedge-taken count = iterations - 1; add 1 for total count.
         CountSCEV = SE.getAddExpr(
@@ -291,7 +291,7 @@ static void emitBatchMarkAccess(
     }
 
     llvm::BasicBlock *HoistPreheader = HoistTarget->getLoopPreheader();
-    if (!HoistPreheader) return;
+    if (!HoistPreheader) return false;
 
     if (HoistTarget != L)
         llvm::errs() << "[UVM] BatchMarkAccess hoisted depth "
@@ -309,6 +309,7 @@ static void emitBatchMarkAccess(
     llvm::IRBuilder<> B(HoistPreheader->getTerminator());
     llvm::Value *BaseInt = B.CreatePtrToInt(BasePtr, I64Ty, "batch.base");
     B.CreateCall(BatchMarkFn, {BaseInt, StrideVal, CountVal});
+    return true;
 }
 
 llvm::Value *emitPageInvarianceRuntimeCheck(
@@ -483,9 +484,12 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
                 if (Result.kind == PageInvariance::Variant && Result.stride) {
                     errs() << "[UVM] BatchMarkAccess: stride=" << *Result.stride
                            << " TC=" << Result.tripCount << "\n";
-                    emitBatchMarkAccess(Ptr, L, Result, SE, BatchMarkFn,
-                                       M.getDataLayout());
-                    continue;
+                    if (emitBatchMarkAccess(Ptr, L, Result, SE, BatchMarkFn,
+                                           M.getDataLayout()))
+                        continue;
+                    else
+                        errs() << "[UVM] BatchMarkAccess failed to emit for " << *Ptr << "\n";
+                    // batch failed — fall through to per-instruction fallback
                 }
                 // Unknown → per-instruction fallback
             } 
