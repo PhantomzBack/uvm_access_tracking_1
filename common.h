@@ -10,7 +10,8 @@
 // ── Common definitions and utilities ───────────────────────────────────────────
 #define DBG printf("At line: %d\n", __LINE__);
 #define DBG_RET(ret) printf("At line: %d, returning %d\n", __LINE__, ret); return ret;
-#ifdef DEB
+// #define DEBUG
+#ifdef DEBUG
     #define LOG(...) printf(__VA_ARGS__)
 #else
     #define LOG(...) ((void)0)

@@ -4,7 +4,6 @@
 extern "C" {
     // shadow_l1 points to the L1 table (array of 512 void** pointers)
     __device__ void*** shadow_l1 = nullptr;
-    __device__ unsigned long long last_page_cache = 0;
 
 
     // ── MarkAccess ────────────────────────────────────────────────────────────
@@ -112,8 +111,15 @@ extern "C" {
         void**              l2_table  = nullptr;
         unsigned long long* l3_bitmap = nullptr;
 
+        uintptr_t last_page = (uintptr_t)-1;
         for (uint64_t i = 0; i < count; i++) {
             uintptr_t addr = (uintptr_t)((intptr_t)base_addr + (int64_t)i * stride);
+
+            // Fast path: if stride < PAGE_SIZE, multiple consecutive iterations
+            // land on the same page — skip the full tree walk for repeats.
+            uintptr_t cur_page = addr >> 12;
+            if (cur_page == last_page) continue;
+            last_page = cur_page;
 
             uint32_t l1_idx    = (uint32_t)((addr >> L1_SHIFT) & L1_MASK);
             uint32_t l2_idx    = (uint32_t)((addr >> L2_SHIFT) & L2_MASK);

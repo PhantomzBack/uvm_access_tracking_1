@@ -13,6 +13,32 @@
 static constexpr uint64_t PAGE_SHIFT = 12;
 static constexpr uint64_t PAGE_SIZE  = (1ULL << PAGE_SHIFT); // 4096
 
+// Trace through addrspacecast and GEPs to find the true allocation address space.
+// In LLVM 20 opaque-pointer mode, __shared__ arrays are cast to generic AS 0 via
+// an inline ConstantExpr addrspacecast (ptr addrspace(3) @As to ptr), which appears
+// as the base pointer of GEPs but is NOT an AddrSpaceCastInst — it's a ConstantExpr.
+static unsigned trueAddressSpace(llvm::Value *V) {
+    while (true) {
+        if (auto *ASC = llvm::dyn_cast<llvm::AddrSpaceCastInst>(V))
+            return ASC->getPointerOperand()->getType()->getPointerAddressSpace();
+        // ConstantExpr addrspacecast — the common case for __shared__ globals
+        if (auto *CE = llvm::dyn_cast<llvm::ConstantExpr>(V)) {
+            if (CE->getOpcode() == llvm::Instruction::AddrSpaceCast)
+                return CE->getOperand(0)->getType()->getPointerAddressSpace();
+            if (CE->getOpcode() == llvm::Instruction::GetElementPtr) {
+                V = CE->getOperand(0);
+                continue;
+            }
+        }
+        if (auto *GEP = llvm::dyn_cast<llvm::GEPOperator>(V)) {
+            V = GEP->getPointerOperand();
+            continue;
+        }
+        break;
+    }
+    return V->getType()->getPointerAddressSpace();
+}
+
 
 llvm::Function *MarkFuncPtr = nullptr;
 
@@ -238,6 +264,9 @@ llvm::Function *getBatchMarkAccessFn(llvm::Module &M) {
 // Emit a single BatchMarkAccess(base, stride, count) call in the loop preheader.
 // Handles both compile-time-constant and runtime (loop-invariant) stride/TC by
 // expanding all three arguments via SCEVExpander.
+// When SCEV cannot compute the trip count (typical for GPU grid-stride loops whose
+// bound is a kernel arg and start depends on blockIdx/threadIdx), falls back to
+// emitting ceildiv(bound - start, step) as IR at the preheader.
 static bool emitBatchMarkAccess(
         llvm::Value *Ptr, llvm::Loop *L,
         const PageInvarianceResult &Result,
@@ -263,20 +292,78 @@ static bool emitBatchMarkAccess(
     const llvm::SCEV *StrideSCEV =
         SE.getTruncateOrSignExtend(Result.stride, I64Ty);
 
-    // ── Trip count: prefer static value, fall back to backedge SCEV + 1 ──────
+    // ── Trip count: static → SCEV BTC → runtime recovery ────────────────────
+    bool needRuntimeCount  = false;
+    bool needInclusiveBound = false;
+    const llvm::SCEV *IVStartSCEV = nullptr;
+    const llvm::SCEV *IVStepSCEV  = nullptr;
+    llvm::Value      *BoundValIR  = nullptr;
+
     const llvm::SCEV *CountSCEV = nullptr;
     if (Result.tripCount > 0) {
         CountSCEV = SE.getConstant(I64Ty, Result.tripCount);
     } else {
         const llvm::SCEV *BTC = SE.getBackedgeTakenCount(L);
-        if (llvm::isa<llvm::SCEVCouldNotCompute>(BTC)) {
-            llvm::errs() << "[UVM] BatchMarkAccess: trip count unresolvable for " << *PtrSCEV << "\n";
-            return false;
+        if (!llvm::isa<llvm::SCEVCouldNotCompute>(BTC)) {
+            CountSCEV = SE.getAddExpr(
+                SE.getTruncateOrZeroExtend(BTC, I64Ty),
+                SE.getConstant(I64Ty, 1));
+        } else {
+            // SCEV can't model the trip count. Recover by inspecting the loop
+            // exit branch: extract the IV AddRec and loop-invariant bound, then
+            // emit ceildiv(bound - start, step) as IR at the preheader.
+            llvm::BasicBlock *ExitingBB = L->getExitingBlock();
+            if (!ExitingBB) {
+                llvm::errs() << "[UVM] BatchMarkAccess: no single exiting block\n";
+                return false;
+            }
+            auto *BI = llvm::dyn_cast<llvm::BranchInst>(ExitingBB->getTerminator());
+            if (!BI || !BI->isConditional()) return false;
+            auto *Cmp = llvm::dyn_cast<llvm::ICmpInst>(BI->getCondition());
+            if (!Cmp) return false;
+
+            // Loop continues on the true successor; invert predicate if needed.
+            bool TrueIsLoop = L->contains(BI->getSuccessor(0));
+            llvm::ICmpInst::Predicate Pred = Cmp->getPredicate();
+            llvm::Value *LHS = Cmp->getOperand(0);
+            llvm::Value *RHS = Cmp->getOperand(1);
+            if (!TrueIsLoop)
+                Pred = llvm::CmpInst::getInversePredicate(Pred);
+
+            // Normalize to LHS < RHS (ULT or SLT).
+            if (Pred == llvm::ICmpInst::ICMP_UGT || Pred == llvm::ICmpInst::ICMP_SGT ||
+                Pred == llvm::ICmpInst::ICMP_UGE || Pred == llvm::ICmpInst::ICMP_SGE) {
+                std::swap(LHS, RHS);
+                Pred = llvm::CmpInst::getSwappedPredicate(Pred);
+            }
+            // Convert inclusive upper bound (SLE/ULE: a <= bound) to exclusive
+            // (a < bound+1) so the ceildiv formula works uniformly.
+            bool inclusiveBound = false;
+            if (Pred == llvm::ICmpInst::ICMP_SLE || Pred == llvm::ICmpInst::ICMP_ULE) {
+                inclusiveBound = true;
+                Pred = (Pred == llvm::ICmpInst::ICMP_SLE)
+                       ? llvm::ICmpInst::ICMP_SLT : llvm::ICmpInst::ICMP_ULT;
+            }
+            if (Pred != llvm::ICmpInst::ICMP_ULT && Pred != llvm::ICmpInst::ICMP_SLT &&
+                Pred != llvm::ICmpInst::ICMP_NE)
+                return false;
+
+            // Bound (RHS = 'n') must be loop-invariant.
+            if (!L->isLoopInvariant(RHS)) return false;
+            BoundValIR = RHS;
+
+            // LHS must be an affine AddRec over L so we can read start and step.
+            auto *IvAR = llvm::dyn_cast<llvm::SCEVAddRecExpr>(SE.getSCEV(LHS));
+            if (!IvAR || !IvAR->isAffine() || IvAR->getLoop() != L) return false;
+
+            IVStartSCEV = SE.getTruncateOrZeroExtend(IvAR->getStart(), I64Ty);
+            IVStepSCEV  = SE.getTruncateOrSignExtend(IvAR->getStepRecurrence(SE), I64Ty);
+            needRuntimeCount  = true;
+            needInclusiveBound = inclusiveBound;
+            // Use a constant dummy for the hoisting invariance check; the real
+            // runtime count (derived from kernel args) is invariant at every loop level.
+            CountSCEV = SE.getConstant(I64Ty, 0);
         }
-        // BTC is backedge-taken count = iterations - 1; add 1 for total count.
-        CountSCEV = SE.getAddExpr(
-            SE.getTruncateOrZeroExtend(BTC, I64Ty),
-            SE.getConstant(I64Ty, 1));
     }
 
     // ── Hoist: walk up to the outermost loop where all three are invariant ────
@@ -298,13 +385,35 @@ static bool emitBatchMarkAccess(
                      << L->getLoopDepth() << " → "
                      << HoistTarget->getLoopDepth() << "\n";
 
-    // ── Expand all three SCEVs to IR values at the chosen preheader ───────────
+    // ── Expand SCEVs and emit runtime count (if needed) ───────────────────────
     llvm::SCEVExpander Expander(SE, DL, "batch.mark");
     auto InsertIt = HoistPreheader->getTerminator()->getIterator();
 
     llvm::Value *BasePtr   = Expander.expandCodeFor(BaseSCEV,   PtrTy,  InsertIt);
     llvm::Value *StrideVal = Expander.expandCodeFor(StrideSCEV, I64Ty,  InsertIt);
-    llvm::Value *CountVal  = Expander.expandCodeFor(CountSCEV,  I64Ty,  InsertIt);
+    llvm::Value *CountVal;
+
+    if (needRuntimeCount) {
+        llvm::IRBuilder<> RB(HoistPreheader->getTerminator());
+        llvm::Value *StartV = Expander.expandCodeFor(IVStartSCEV, I64Ty, InsertIt);
+        llvm::Value *StepV  = Expander.expandCodeFor(IVStepSCEV,  I64Ty, InsertIt);
+        llvm::Value *BoundV = RB.CreateZExtOrTrunc(BoundValIR, I64Ty, "bound.i64");
+        // For inclusive upper bound (a <= bound), treat as a < bound+1.
+        if (needInclusiveBound)
+            BoundV = RB.CreateAdd(BoundV, llvm::ConstantInt::get(I64Ty, 1), "bound.inc");
+        // ceildiv(Bound - Start, Step) = (Bound - Start + Step - 1) / Step
+        llvm::Value *Range  = RB.CreateSub(BoundV, StartV, "rt.range");
+        llvm::Value *Step1  = RB.CreateSub(StepV, llvm::ConstantInt::get(I64Ty, 1), "step.m1");
+        llvm::Value *Ceil   = RB.CreateAdd(Range, Step1, "rt.ceil");
+        llvm::Value *Div    = RB.CreateUDiv(Ceil, StepV, "rt.count.raw");
+        // Clamp to 0 if start >= bound (thread starts past the array end).
+        llvm::Value *Active = RB.CreateICmpULT(StartV, BoundV, "rt.active");
+        CountVal = RB.CreateSelect(Active, Div,
+                                   llvm::ConstantInt::get(I64Ty, 0), "rt.count");
+        llvm::errs() << "[UVM] BatchMarkAccess: emitting runtime count for " << *PtrSCEV << "\n";
+    } else {
+        CountVal = Expander.expandCodeFor(CountSCEV, I64Ty, InsertIt);
+    }
 
     llvm::IRBuilder<> B(HoistPreheader->getTerminator());
     llvm::Value *BaseInt = B.CreatePtrToInt(BasePtr, I64Ty, "batch.base");
@@ -343,7 +452,8 @@ llvm::Value *emitPageInvarianceRuntimeCheck(
         if (!Ptr) return;
 
         // Skip non-UVM (addrspace 0 = generic/UVM on CUDA, 1 = global)
-        unsigned AS = Ptr->getType()->getPointerAddressSpace();
+        // Use trueAddressSpace to see through addrspacecast (e.g. __shared__ AS3 → AS0).
+        unsigned AS = trueAddressSpace(Ptr);
         if (AS != 0 && AS != 1) return;
 
         auto Result = checkPageInvariance(Ptr, L, SE);
@@ -398,14 +508,6 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
         "MarkAccess", Type::getVoidTy(Ctx), Type::getInt64Ty(Ctx));
     auto *BatchMarkFn = getBatchMarkAccessFn(M);
 
-    GlobalVariable *CacheVar = M.getGlobalVariable("last_page_cache");
-    if (!CacheVar) {
-        CacheVar = new GlobalVariable(M, Type::getInt64Ty(Ctx), false,
-                                     GlobalValue::ExternalLinkage, nullptr,
-                                     "last_page_cache", nullptr,
-                                     GlobalValue::NotThreadLocal, 1);
-    }
-
     // ── Get the FAM proxy so we can request function-level analyses ──
     auto &FAMProxy = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M);
     FunctionAnalysisManager &FAM = FAMProxy.getManager();
@@ -432,13 +534,23 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
                 if (auto *LI = dyn_cast<LoadInst>(&Inst))  Ptr = LI->getPointerOperand();
                 if (auto *SI = dyn_cast<StoreInst>(&Inst)) Ptr = SI->getPointerOperand();
 
-                if (Ptr && Ptr != CacheVar && Ptr->getType()->isPointerTy()) {
-                    unsigned AS = Ptr->getType()->getPointerAddressSpace();
-                    if (AS <= 1)
+                if (Ptr && Ptr->getType()->isPointerTy()) {
+                    unsigned AS = trueAddressSpace(Ptr);
+                    if (AS == 0 || AS == 1)
                         Targets.push_back(&Inst);
                 }
             }
         }
+
+        // Per-thread page cache: alloca in the entry block so each GPU thread
+        // gets its own copy in registers instead of sharing a device global.
+        // Created after Phase 1 so its own store won't end up in Targets.
+        IRBuilder<> AllocaBuilder(&F.getEntryBlock(),
+                                  F.getEntryBlock().getFirstInsertionPt());
+        AllocaInst *LocalCacheVar = AllocaBuilder.CreateAlloca(
+            Type::getInt64Ty(Ctx), nullptr, "last_page_local");
+        AllocaBuilder.CreateStore(
+            ConstantInt::get(Type::getInt64Ty(Ctx), ~0ULL), LocalCacheVar);
 
         // ── PHASE TWO: Instrument ──
         errs() << "[UvmPass] Found " << Targets.size() << " targets in "
@@ -499,13 +611,13 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
             IRBuilder<> Builder(Inst);
             Value *AddrInt  = Builder.CreatePtrToInt(Ptr, Builder.getInt64Ty());
             Value *CurPage  = Builder.CreateLShr(AddrInt, 12);
-            Value *LastPage = Builder.CreateLoad(Builder.getInt64Ty(), CacheVar);
+            Value *LastPage = Builder.CreateLoad(Builder.getInt64Ty(), LocalCacheVar);
             Value *IsNewPage = Builder.CreateICmpNE(CurPage, LastPage);
 
             Instruction *ThenTerm = SplitBlockAndInsertIfThen(IsNewPage, Inst, false);
             Builder.SetInsertPoint(ThenTerm);
             Builder.CreateCall(MarkFunc, {AddrInt});
-            Builder.CreateStore(CurPage, CacheVar);
+            Builder.CreateStore(CurPage, LocalCacheVar);
 
             Changed = true;
             errs() << "   [+] Instrumented: " << *Inst << "\n";
