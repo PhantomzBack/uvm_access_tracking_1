@@ -98,73 +98,109 @@ extern "C" {
     }
 
     // ── BatchMarkAccess ───────────────────────────────────────────────────────
-    // Optimised for affine recurrences: caches the resolved L2 and L3 pointers
-    // across iterations so we pay the tree-traversal cost at most once per
-    // unique (l1_idx, l2_idx) pair instead of once per iteration.
+    // Two key optimisations over the naive per-element loop:
+    //
+    //  1. O(count) → O(pages) for dense strides (stride < PAGE_SIZE):
+    //     When stride < 4KB, consecutive elements share pages (no page gaps exist
+    //     between start and end). Compute [start_page, end_page] directly and loop
+    //     over pages — 1024x fewer iterations for float coalesced access (4B stride).
+    //
+    //  2. Warp-level deduplication:
+    //     For coalesced access, all 32 threads in a warp access the same pages.
+    //     The warp leader (lowest active lane) broadcasts its page range; any thread
+    //     whose range is fully covered by the leader's can exit immediately, letting
+    //     the leader handle the marking for the whole warp.
     __device__ void BatchMarkAccess(uintptr_t base_addr, int64_t stride, uint64_t count)
     {
         if (!shadow_l1 || count == 0) return;
 
-        // Thread-local pointer cache (lives in registers for this call).
+        // Helper: traverse L1→L2→L3 and mark one page.
+        // Declared as a lambda-style macro to avoid a device function call.
+        // 'cached_l1', 'cached_l2', 'l2_table', 'l3_bitmap' are in the caller's scope.
+#define MARK_PAGE(addr)                                                          \
+        do {                                                                     \
+            uint32_t _l1 = (uint32_t)(((addr) >> L1_SHIFT) & L1_MASK);          \
+            uint32_t _l2 = (uint32_t)(((addr) >> L2_SHIFT) & L2_MASK);          \
+            uint32_t _l3 = (uint32_t)(((addr) >> L3_SHIFT) & L3_MASK);          \
+            if (_l1 != cached_l1) {                                              \
+                if (!shadow_l1[_l1]) {                                           \
+                    void** _nl2 = (void**)malloc(L2_ENTRIES * sizeof(void*));    \
+                    if (!_nl2) break;                                             \
+                    unsigned long long _old = atomicCAS(                         \
+                        (unsigned long long*)&shadow_l1[_l1],                   \
+                        0ULL, (unsigned long long)_nl2);                         \
+                    if (_old != 0ULL) free(_nl2);                                \
+                    else              memset(_nl2, 0, L2_ENTRIES * sizeof(void*)); \
+                }                                                                \
+                l2_table  = (void**)shadow_l1[_l1];                             \
+                cached_l1 = _l1;  cached_l2 = (uint32_t)-1;  l3_bitmap = nullptr; \
+            }                                                                    \
+            if (_l2 != cached_l2) {                                              \
+                if (!l2_table[_l2]) {                                            \
+                    void* _nl3 = malloc(L3_BYTES);                               \
+                    if (!_nl3) break;                                             \
+                    unsigned long long _old = atomicCAS(                         \
+                        (unsigned long long*)&l2_table[_l2],                    \
+                        0ULL, (unsigned long long)_nl3);                         \
+                    if (_old != 0ULL) free(_nl3);                                \
+                    else              memset(_nl3, 0, L3_BYTES);                 \
+                }                                                                \
+                l3_bitmap = (unsigned long long*)l2_table[_l2];                 \
+                cached_l2 = _l2;                                                 \
+            }                                                                    \
+            if (l3_bitmap) {                                                     \
+                unsigned long long* _w = &l3_bitmap[_l3 / 64];                  \
+                unsigned long long  _m = 1ULL << (_l3 % 64);                    \
+                if (!(*_w & _m)) atomicOr(_w, _m);                              \
+            }                                                                    \
+        } while (0)
+
         uint32_t            cached_l1 = (uint32_t)-1;
         uint32_t            cached_l2 = (uint32_t)-1;
         void**              l2_table  = nullptr;
         unsigned long long* l3_bitmap = nullptr;
 
+        // ── Opt 1: dense stride → page-range loop ────────────────────────────
+        // When 0 < stride < PAGE_SIZE there are no page gaps between first and
+        // last element (adjacent elements are <4KB apart), so every page in
+        // [start_page, end_page] is touched. Skip the per-element multiply.
+        if (stride > 0 && (uint64_t)stride < (1ULL << L3_SHIFT)) {
+            uintptr_t start_page = base_addr >> 12;
+            uintptr_t end_page   = (base_addr + (uint64_t)(count - 1) * (uint64_t)stride) >> 12;
+
+            // ── Opt 2: warp-level deduplication ──────────────────────────────
+            // For coalesced access all warp lanes span the same page range.
+            // The lowest active lane (leader) broadcasts its range; any thread
+            // whose range is fully covered skips — the leader handles them.
+            unsigned active      = __activemask();
+            int      my_lane     = threadIdx.x & 31;
+            int      leader_lane = __ffs(active) - 1;
+            unsigned long long l0_start = __shfl_sync(active, (unsigned long long)start_page, leader_lane);
+            unsigned long long l0_end   = __shfl_sync(active, (unsigned long long)end_page,   leader_lane);
+            if (my_lane != leader_lane
+                    && l0_start <= (unsigned long long)start_page
+                    && l0_end   >= (unsigned long long)end_page)
+                return;
+
+            for (uintptr_t p = start_page; p <= end_page; p++)
+                MARK_PAGE(p << 12);
+
+            return;
+        }
+
+        // ── Sparse strides (stride ≥ PAGE_SIZE or ≤ 0): element-by-element ──
+        // Elements may skip pages (stride ≥ 4KB) or go backwards; iterate per
+        // element and use last_page to skip same-page repeats.
         uintptr_t last_page = (uintptr_t)-1;
         for (uint64_t i = 0; i < count; i++) {
-            uintptr_t addr = (uintptr_t)((intptr_t)base_addr + (int64_t)i * stride);
-
-            // Fast path: if stride < PAGE_SIZE, multiple consecutive iterations
-            // land on the same page — skip the full tree walk for repeats.
+            uintptr_t addr     = (uintptr_t)((intptr_t)base_addr + (int64_t)i * stride);
             uintptr_t cur_page = addr >> 12;
             if (cur_page == last_page) continue;
             last_page = cur_page;
-
-            uint32_t l1_idx    = (uint32_t)((addr >> L1_SHIFT) & L1_MASK);
-            uint32_t l2_idx    = (uint32_t)((addr >> L2_SHIFT) & L2_MASK);
-            uint32_t l3_offset = (uint32_t)((addr >> L3_SHIFT) & L3_MASK);
-
-            // ── L1 cache: demand-allocate L2 table on miss ────────────────────
-            if (l1_idx != cached_l1) {
-                if (!shadow_l1[l1_idx]) {
-                    void** new_l2 = (void**)malloc(L2_ENTRIES * sizeof(void*));
-                    if (!new_l2) continue;
-                    unsigned long long old = atomicCAS(
-                        (unsigned long long*)&shadow_l1[l1_idx],
-                        0ULL, (unsigned long long)new_l2);
-                    if (old != 0ULL) free(new_l2);
-                    else             memset(new_l2, 0, L2_ENTRIES * sizeof(void*));
-                }
-                l2_table  = (void**)shadow_l1[l1_idx];
-                cached_l1 = l1_idx;
-                cached_l2 = (uint32_t)-1;  // L2 index stale after L1 miss
-                l3_bitmap = nullptr;
-            }
-
-            // ── L2 cache: demand-allocate L3 leaf on miss ─────────────────────
-            if (l2_idx != cached_l2) {
-                if (!l2_table[l2_idx]) {
-                    void* new_l3 = malloc(L3_BYTES);
-                    if (!new_l3) continue;
-                    unsigned long long old = atomicCAS(
-                        (unsigned long long*)&l2_table[l2_idx],
-                        0ULL, (unsigned long long)new_l3);
-                    if (old != 0ULL) free(new_l3);
-                    else             memset(new_l3, 0, L3_BYTES);
-                }
-                l3_bitmap = (unsigned long long*)l2_table[l2_idx];
-                cached_l2 = l2_idx;
-            }
-
-            // ── L3: mark the bit; skip atomicOr when already set ──────────────
-            if (l3_bitmap) {
-                unsigned long long* word = &l3_bitmap[l3_offset / 64];
-                unsigned long long  mask = 1ULL << (l3_offset % 64);
-                if (!(*word & mask))   // non-atomic pre-check avoids redundant atomics
-                    atomicOr(word, mask);
-            }
+            MARK_PAGE(addr);
         }
+
+#undef MARK_PAGE
     }
 
     __global__ void copy_l2_to_host(void*** l1, int l1_idx, void** out, int n)

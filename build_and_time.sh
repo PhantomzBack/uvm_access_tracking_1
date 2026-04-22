@@ -1,14 +1,15 @@
 #!/bin/bash
 
 # Configuration
-GPU_ARCH="sm_89"
+GPU_ARCH="sm_80"
 CUDA_PATH="/usr/local/cuda"
 CLANG="clang++-20"
 PLUGIN="./build/UvmTrackingPass.so"
 ADDITIONAL_FLAGS="-fgpu-rdc -g -O2"
-INCLUDE_DIR="-I./include"
+INCLUDE_DIR="-I./include -I../cutlass/include"
 LIB_SRC="./libMarkAccess.cu"
 TARGET_FILE="../examples/benchmark_kernel_single.cu"
+OTHER_LIBRARIES="-lcudart -lcublas"
 
 # Check if a filename was provided
 if [ "$#" -lt 1 ]; then
@@ -45,7 +46,7 @@ $CLANG -x cuda --cuda-gpu-arch=$GPU_ARCH \
     -fpass-plugin=$PLUGIN \
     "$SOURCE_INPUT" "$LIB_SRC" \
     --cuda-path=$CUDA_PATH -L$CUDA_PATH/lib64 \
-    -lcudart -o "$EXE_INSTRUMENTED"
+    -lcudart -lcublas -o "$EXE_INSTRUMENTED"
 
 if [ $? -eq 0 ]; then
     echo "Successfully built: $EXE_INSTRUMENTED"
@@ -61,7 +62,7 @@ $CLANG -x cuda --cuda-gpu-arch=$GPU_ARCH \
     $INCLUDE_DIR \
     "$SOURCE_INPUT" \
     --cuda-path=$CUDA_PATH -L$CUDA_PATH/lib64 \
-    -lcudart -o "$EXE_NORMAL"
+    -lcudart -lcublas -o "$EXE_NORMAL"
 
 if [ $? -eq 0 ]; then
     echo "Successfully built: $EXE_NORMAL"
