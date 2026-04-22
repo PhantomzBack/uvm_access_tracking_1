@@ -9,6 +9,7 @@
 #include "llvm/IR/Constants.h"
 #include <llvm-20/llvm/Support/raw_ostream.h>
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
+#include <set>
 
 static constexpr uint64_t PAGE_SHIFT = 12;
 static constexpr uint64_t PAGE_SIZE  = (1ULL << PAGE_SHIFT); // 4096
@@ -547,18 +548,29 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
         // Created after Phase 1 so its own store won't end up in Targets.
         IRBuilder<> AllocaBuilder(&F.getEntryBlock(),
                                   F.getEntryBlock().getFirstInsertionPt());
-        AllocaInst *LocalCacheVar = AllocaBuilder.CreateAlloca(
-            Type::getInt64Ty(Ctx), nullptr, "last_page_local");
-        AllocaBuilder.CreateStore(
-            ConstantInt::get(Type::getInt64Ty(Ctx), ~0ULL), LocalCacheVar);
 
         // ── PHASE TWO: Instrument ──
         errs() << "[UvmPass] Found " << Targets.size() << " targets in "
                << F.getName() << "\n";
+               
+        std::set<const SCEV*> InstrumentedInBlock;
+        BasicBlock *CurrentBlock = nullptr;
+
         for (Instruction *Inst : Targets) {
+            if (Inst->getParent() != CurrentBlock) {
+                CurrentBlock = Inst->getParent();
+                InstrumentedInBlock.clear();
+            }
+
             Value *Ptr = isa<LoadInst>(Inst)
                              ? cast<LoadInst>(Inst)->getPointerOperand()
                              : cast<StoreInst>(Inst)->getPointerOperand();
+
+            const SCEV *PtrSCEV = SE.getSCEV(Ptr);
+            if (!InstrumentedInBlock.insert(PtrSCEV).second) {
+                errs() << "   [-] Skipping already instrumented pointer (SCEV) in block: " << *PtrSCEV << "\n";
+                continue;
+            }
 
             if (const DebugLoc &DL = Inst->getDebugLoc()) {
                 errs() << "[UvmPass] Instrumenting " 
@@ -608,6 +620,11 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
 
 
                     // fallback: per-instruction instrumentation
+            AllocaInst *LocalCacheVar = AllocaBuilder.CreateAlloca(
+                Type::getInt64Ty(Ctx), nullptr, "last_page_local");
+            AllocaBuilder.CreateStore(
+                ConstantInt::get(Type::getInt64Ty(Ctx), ~0ULL), LocalCacheVar);
+
             IRBuilder<> Builder(Inst);
             Value *AddrInt  = Builder.CreatePtrToInt(Ptr, Builder.getInt64Ty());
             Value *CurPage  = Builder.CreateLShr(AddrInt, 12);
