@@ -73,6 +73,13 @@ def extract_time(output):
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     force_rebuild = "--rebuild" in sys.argv
+    check_pagelogs = "--check" in sys.argv
+
+    # Parse optional output markdown filename
+    md_filename = "results.md"
+    args = [arg for arg in sys.argv[1:] if not arg.startswith("--")]
+    if args:
+        md_filename = args[0]
 
     os.makedirs(LOG_DIR, exist_ok=True)
     os.makedirs("build",  exist_ok=True)
@@ -155,12 +162,40 @@ def main():
     table = "\n".join([hdr, sep] + rows)
     md = f"# Benchmark Results\n\nSM arch: sm_{SM_ARCH}\n\n{table}\n"
 
-    with open("results.md", "w") as f:
+    with open(md_filename, "w") as f:
         f.write(md)
 
     print(f"\n── Summary ───────────────────────────────────────────────────────────")
     print(md)
     print(f"Full logs in '{LOG_DIR}/', page access logs in *.pagelog")
+    print(f"Markdown results written to: {md_filename}")
+
+    # Optional: run pagelog correctness check using scripts/run_pgelog_test.py
+    if check_pagelogs:
+        try:
+            from scripts.run_pgelog_test import PagelogTester
+        except Exception as e:
+            print(f"\n✗ Could not import PagelogTester: {e}")
+            sys.exit(2)
+
+        print("\n── Pagelog correctness check (--check) ───────────────────────────────")
+        tester = PagelogTester(root_dir=os.getcwd())
+
+        # Backup generated pagelogs into tester.current_dir (will copy *.pagelog)
+        ok = tester.backup_generated_pagelogs()
+        if not ok:
+            print("\n✗ No pagelog files found to check")
+            sys.exit(2)
+
+        passed, results = tester.compare_pagelogs()
+        tester.print_summary(passed, results)
+
+        if not passed:
+            print("\n✗ Pagelog verification failed")
+            sys.exit(3)
+        else:
+            print("\n✓ Pagelog verification passed")
+            # fall through and exit normally
 
 if __name__ == "__main__":
     main()
