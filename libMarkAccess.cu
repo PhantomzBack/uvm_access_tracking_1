@@ -86,11 +86,35 @@ extern "C" {
         if (l3_bitmap) {
             LOG("[MarkAccess] marking page accessed in L3 bitmap for L1 index %u, L2 index %u, bit %u, was %lld\n",
                 l1_idx, l2_idx, l3_offset, (l3_bitmap[l3_offset / 64] >> (l3_offset % 64)) & 1ULL);
-            unsigned long long* word = &l3_bitmap[l3_offset / 64];
-            unsigned long long  mask = 1ULL << (l3_offset % 64);
-            atomicOr(word, mask);
-            LOG("[MarkAccess] after atomicOr, bit is now %lld\n",
-                ((*word) >> (l3_offset % 64)) & 1ULL);
+
+            // Warp-aggregated atomicOr: group threads in the warp by target 64-bit
+            // word (identified by L1,L2,word_idx) and OR their bitmasks together
+            // using shfl_xor reductions conditioned on matching keys. Only the
+            // group's leader performs a single 64-bit atomicOr.
+            unsigned full = __activemask();
+            uint32_t word_idx = l3_offset / 64;
+            unsigned long long my_mask = 1ULL << (l3_offset % 64);
+            uint32_t key = (l1_idx << 21) | (l2_idx << 9) | word_idx; // fits in 30 bits
+
+            unsigned long long agg = my_mask;
+            for (int off = 16; off > 0; off >>= 1) {
+                unsigned long long other = __shfl_xor_sync(full, agg, off);
+                uint32_t other_key = __shfl_xor_sync(full, key, off);
+                if (other_key == key) agg |= other;
+            }
+
+            int lane = threadIdx.x & 31;
+            uint32_t group_mask = __ballot_sync(full, key == __shfl_sync(full, key, lane));
+            int leader = __ffs(group_mask) - 1;
+            if (lane == leader) {
+                unsigned long long* word = &l3_bitmap[word_idx];
+                unsigned long long prev = *word;
+                unsigned long long delta = agg & ~prev;
+                if (delta) atomicOr(word, delta);
+                unsigned long long after = *word;
+                LOG("[MarkAccess] after atomicOr, bit is now %lld (delta=0x%llx)\\n",
+                    ((after >> (l3_offset % 64)) & 1ULL), delta);
+            }
         } else {
             LOG("[MarkAccess] error: L3 bitmap not allocated for L1 index %u, L2 index %u\n",
                    l1_idx, l2_idx);
@@ -151,7 +175,7 @@ extern "C" {
             if (l3_bitmap) {                                                     \
                 unsigned long long* _w = &l3_bitmap[_l3 / 64];                  \
                 unsigned long long  _m = 1ULL << (_l3 % 64);                    \
-                if (!(*_w & _m)) atomicOr(_w, _m);                              \
+                    if (!(*_w & _m)) atomicOr(_w, _m);                              \
             }                                                                    \
         } while (0)
 
