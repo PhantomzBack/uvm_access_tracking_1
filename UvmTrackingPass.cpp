@@ -367,6 +367,16 @@ static bool emitBatchMarkAccess(
         }
     }
 
+    // Threshold: avoid batching if count is known and excessively large (>1000)
+    // to prevent high overhead from marking too many pages.
+    if (auto *ConstCount = llvm::dyn_cast<llvm::SCEVConstant>(CountSCEV)) {
+        uint64_t countVal = ConstCount->getAPInt().getZExtValue();
+        if (countVal > 1000) {
+            llvm::errs() << "[UVM] BatchMarkAccess: count " << countVal << " too large, skipping\n";
+            return false;
+        }
+    }
+
     // ── Hoist: walk up to the outermost loop where all three are invariant ────
     llvm::Loop *HoistTarget = L;
     for (llvm::Loop *Parent = L->getParentLoop();
