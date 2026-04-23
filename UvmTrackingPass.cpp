@@ -407,9 +407,14 @@ static bool emitBatchMarkAccess(
         llvm::Value *Step1  = RB.CreateSub(StepV, llvm::ConstantInt::get(I64Ty, 1), "step.m1");
         llvm::Value *Ceil   = RB.CreateAdd(Range, Step1, "rt.ceil");
         llvm::Value *Div    = RB.CreateUDiv(Ceil, StepV, "rt.count.raw");
+
+        // Loop rotation guarantees the exit condition tests i_next, so Div computes
+        // the BackedgeTakenCount. The total TripCount is Div + 1.
+        llvm::Value *TripCount = RB.CreateAdd(Div, llvm::ConstantInt::get(I64Ty, 1), "rt.count.trip");
+
         // Clamp to 0 if start >= bound (thread starts past the array end).
         llvm::Value *Active = RB.CreateICmpULT(StartV, BoundV, "rt.active");
-        CountVal = RB.CreateSelect(Active, Div,
+        CountVal = RB.CreateSelect(Active, TripCount,
                                    llvm::ConstantInt::get(I64Ty, 0), "rt.count");
         llvm::errs() << "[UVM] BatchMarkAccess: emitting runtime count for " << *PtrSCEV << "\n";
     } else {
@@ -534,6 +539,8 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
                 Value *Ptr = nullptr;
                 if (auto *LI = dyn_cast<LoadInst>(&Inst))  Ptr = LI->getPointerOperand();
                 if (auto *SI = dyn_cast<StoreInst>(&Inst)) Ptr = SI->getPointerOperand();
+                if (auto *RMW = dyn_cast<AtomicRMWInst>(&Inst)) Ptr = RMW->getPointerOperand();
+                if (auto *CX = dyn_cast<AtomicCmpXchgInst>(&Inst)) Ptr = CX->getPointerOperand();
 
                 if (Ptr && Ptr->getType()->isPointerTy()) {
                     unsigned AS = trueAddressSpace(Ptr);
@@ -562,9 +569,11 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
                 InstrumentedInBlock.clear();
             }
 
-            Value *Ptr = isa<LoadInst>(Inst)
-                             ? cast<LoadInst>(Inst)->getPointerOperand()
-                             : cast<StoreInst>(Inst)->getPointerOperand();
+            Value *Ptr = nullptr;
+            if (auto *LI = dyn_cast<LoadInst>(Inst))  Ptr = LI->getPointerOperand();
+            else if (auto *SI = dyn_cast<StoreInst>(Inst)) Ptr = SI->getPointerOperand();
+            else if (auto *RMW = dyn_cast<AtomicRMWInst>(Inst)) Ptr = RMW->getPointerOperand();
+            else if (auto *CX = dyn_cast<AtomicCmpXchgInst>(Inst)) Ptr = CX->getPointerOperand();
 
             const SCEV *PtrSCEV = SE.getSCEV(Ptr);
             if (!InstrumentedInBlock.insert(PtrSCEV).second) {
@@ -575,7 +584,7 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
             if (const DebugLoc &DL = Inst->getDebugLoc()) {
                 errs() << "[UvmPass] Instrumenting " 
                        << DL->getFilename() << ":" << DL.getLine()
-                       << " (" << (isa<LoadInst>(Inst) ? "load" : "store") << ")\n";
+                       << " (" << Inst->getOpcodeName() << ")\n";
             } 
 
             // Find which loop this instruction is in (if any)

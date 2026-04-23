@@ -97,14 +97,16 @@ extern "C" {
             uint32_t key = (l1_idx << 21) | (l2_idx << 9) | word_idx; // fits in 30 bits
 
             unsigned long long agg = my_mask;
-            for (int off = 16; off > 0; off >>= 1) {
-                unsigned long long other = __shfl_xor_sync(full, agg, off);
-                uint32_t other_key = __shfl_xor_sync(full, key, off);
-                if (other_key == key) agg |= other;
+            for (int i = 0; i < 32; i++) {
+                if (full & (1 << i)) {
+                    uint32_t shfl_key = __shfl_sync(full, key, i);
+                    unsigned long long shfl_mask = __shfl_sync(full, my_mask, i);
+                    if (shfl_key == key) agg |= shfl_mask;
+                }
             }
 
             int lane = threadIdx.x & 31;
-            uint32_t group_mask = __ballot_sync(full, key == __shfl_sync(full, key, lane));
+            uint32_t group_mask = __match_any_sync(full, key);
             int leader = __ffs(group_mask) - 1;
             if (lane == leader) {
                 unsigned long long* word = &l3_bitmap[word_idx];
@@ -136,6 +138,9 @@ extern "C" {
     //     the leader handle the marking for the whole warp.
     __device__ void BatchMarkAccess(uintptr_t base_addr, int64_t stride, uint64_t count)
     {
+        if (blockIdx.x == 0 && threadIdx.x == 0) {
+            printf("[BatchMarkAccess thread 0] count=%llu stride=%lld\n", (unsigned long long)count, (long long)stride);
+        }
         if (!shadow_l1 || count == 0) return;
 
         // Helper: traverse L1→L2→L3 and mark one page.
