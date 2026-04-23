@@ -162,14 +162,12 @@ void hoistMarkPage(llvm::Value *Ptr, llvm::Loop *L,
     // Insert before the preheader's terminator (the branch into the loop)
     llvm::IRBuilder<> B(Preheader->getTerminator());
 
-    // Cast ptr to i64, shift right by PAGE_SHIFT to get page number
+    // Cast ptr to i64
     auto *I64Ty  = llvm::Type::getInt64Ty(Preheader->getContext());
     auto *PtrInt = B.CreatePtrToInt(Ptr, I64Ty, "ptr.int");
-    auto *PageNo = B.CreateLShr(PtrInt,
-                       llvm::ConstantInt::get(I64Ty, PAGE_SHIFT), "page.no");
 
-    // Call your existing mark_page instrumentation function
-    B.CreateCall(MarkPageFn, {PageNo});
+    // Call MarkAccess with the full address
+    B.CreateCall(MarkPageFn, {PtrInt});
 }
 
 void hoistMarkPageConditional(llvm::Value *Ptr, llvm::Loop *L,
@@ -200,9 +198,8 @@ void hoistMarkPageConditional(llvm::Value *Ptr, llvm::Loop *L,
     llvm::BasicBlock *HoistBB = llvm::BasicBlock::Create(Ctx, "mark.hoist", F,
                                                           L->getHeader());
     llvm::IRBuilder<> HB(HoistBB);
-    llvm::Value *PageNo = HB.CreateLShr(PtrInt,
-                              llvm::ConstantInt::get(I64Ty, PAGE_SHIFT));
-    HB.CreateCall(MarkPageFn, {PageNo});
+    llvm::Value *Addr = HB.CreatePtrToInt(Ptr, I64Ty, "ptr.int");
+    HB.CreateCall(MarkPageFn, {Addr});
     HB.CreateBr(L->getHeader());
 
     // ── 3. Replace preheader's unconditional branch with a conditional one ──
@@ -237,7 +234,10 @@ void hoistBatchMarkPages(llvm::Value *Ptr, llvm::Loop *L,
         llvm::Value *PageNo = B.CreateAdd(BasePage,
                                   llvm::ConstantInt::get(I64Ty, i),
                                   "page.no." + std::to_string(i));
-        B.CreateCall(MarkPageFn, {PageNo});
+        llvm::Value *Addr = B.CreateShl(PageNo,
+                               llvm::ConstantInt::get(I64Ty, PAGE_SHIFT),
+                               "page.addr." + std::to_string(i));
+        B.CreateCall(MarkPageFn, {Addr});
     }
 }
 
