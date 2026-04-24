@@ -15,8 +15,10 @@ LOG_DIR      = "bench_logs"
 BASELINE_DIR = "baselines"
 PRELOAD_SO   = "./libMallocIntercept.so"
 SM_ARCH    = subprocess.getoutput(
-    "nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.'"
+    "nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.'"
 )
+if not SM_ARCH or not SM_ARCH[0].isdigit():
+    SM_ARCH = "89"  # fallback
 BASE_FLAGS = [
     "-x", "cuda", f"--cuda-gpu-arch=sm_{SM_ARCH}",
     "-fgpu-rdc", "-O2", "-I./include",
@@ -47,7 +49,7 @@ def run(cmd, **kw):
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           text=True, **kw)
 
-def compile_pair(src, out_normal, out_instrumented, rdynamic=False):
+def compile_pair(src, out_normal, out_instrumented, rdynamic=False, mode_flag=""):
     """Compile one source file into a normal and an instrumented binary."""
     common = BASE_FLAGS + [src]
     if rdynamic:
@@ -59,12 +61,13 @@ def compile_pair(src, out_normal, out_instrumented, rdynamic=False):
         print(r.stderr[-2000:])
         return False
 
-    r = run([CLANG] + common + [
-        "-DTRACKING_ENABLED",
-        f"-fpass-plugin={PASS_PATH}",
-        LIB_PATH,
-        "-o", out_instrumented,
-    ])
+    inst_flags = ["-DTRACKING_ENABLED", f"-fpass-plugin={PASS_PATH}"]
+    if mode_flag:
+        inst_flags.append(mode_flag)
+    inst_flags.append(LIB_PATH)
+    inst_flags.extend(["-o", out_instrumented])
+
+    r = run([CLANG] + common + inst_flags)
     if r.returncode != 0:
         print(f"\n  ✗ Instrumented compile failed for {src}")
         print(r.stderr[-2000:])
@@ -243,6 +246,12 @@ Examples:
                         help="Run pagelog correctness checks after benchmarks")
     parser.add_argument("--preload", action="store_true",
                         help="Use LD_PRELOAD for malloc intercept")
+    parser.add_argument("--mode", choices=["skip", "alloc", "none"],
+                        default=None,
+                        help="Tracking mode: skip=managed tables, no device alloc; "
+                             "alloc=preload + device alloc fallback; "
+                             "none=legacy device alloc only. "
+                             "Default: skip when --preload, else alloc.")
     parser.add_argument("--diff", nargs=2, metavar=("FILE1", "FILE2"),
                         help="Diff two result markdown files")
 
@@ -257,12 +266,18 @@ Examples:
     gen_baseline      = args.generate_baseline
     check_pagelogs    = args.check
     use_preload       = args.preload
+    mode              = args.mode
+    if mode is None:
+        mode = "skip" if use_preload else "alloc"
     md_filename       = args.output_file
 
     os.makedirs(LOG_DIR,      exist_ok=True)
     os.makedirs("build",      exist_ok=True)
     if gen_baseline:
         os.makedirs(BASELINE_DIR, exist_ok=True)
+
+    # Determine compile-time mode flag
+    mode_flag = f"-DTRACKING_MODE_{mode.upper()}"
 
     # ── Build preload library if needed ────────────────────────────────────────
     if use_preload:
@@ -303,19 +318,26 @@ Examples:
             os.path.getmtime(instrumented_bin) if os.path.exists(instrumented_bin) else 0,
         )
         needs_build = force_rebuild or (max(src_mtime, pass_mtime, lib_mtime) > bin_mtime)
-        # Rebuild if preload flag changed the required flags
+        # Rebuild if preload flag or mode changed
         if use_preload and not os.path.exists(normal_bin):
             needs_build = True
 
         if needs_build:
-            print(f"  Building {stem}...", end=" ", flush=True)
-            ok = compile_pair(src, normal_bin, instrumented_bin, rdynamic=use_preload)
+            print(f"  Building {stem} ({mode_flag})...", end=" ", flush=True)
+            ok = compile_pair(src, normal_bin, instrumented_bin,
+                              rdynamic=use_preload, mode_flag=mode_flag)
             print("ok" if ok else "FAILED")
             if not ok:
                 print("Aborting.")
                 sys.exit(1)
         else:
             print(f"  {stem}: up-to-date (pass --rebuild to force)")
+
+    # ── Environment for LD_PRELOAD (used in both baseline and run phases) ──────
+    preload_env = None
+    if use_preload:
+        preload_env = os.environ.copy()
+        preload_env["LD_PRELOAD"] = os.path.abspath(PRELOAD_SO)
 
     # ── Generate-baseline mode ─────────────────────────────────────────────────
     if gen_baseline:
@@ -346,11 +368,6 @@ Examples:
     # ── Run phase ──────────────────────────────────────────────────────────────
     print("\n── Running benchmarks ────────────────────────────────────────────────")
     results = []  # (name, strategy, t_clean, t_track, overhead, baseline_ok, baseline_detail)
-
-    preload_env = None
-    if use_preload:
-        preload_env = os.environ.copy()
-        preload_env["LD_PRELOAD"] = os.path.abspath(PRELOAD_SO)
 
     for name, src, kid, strategy in BENCHMARKS:
         normal_bin, instrumented_bin = binaries[src]
