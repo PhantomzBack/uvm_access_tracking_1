@@ -4,6 +4,7 @@ import os
 import shutil
 import struct
 import sys
+import argparse
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PASS_PATH    = "./build/UvmTrackingPass.so"
@@ -12,6 +13,7 @@ CUDA_PATH    = "/usr/local/cuda"
 CLANG        = "clang++-20"
 LOG_DIR      = "bench_logs"
 BASELINE_DIR = "baselines"
+PRELOAD_SO   = "./libMallocIntercept.so"
 SM_ARCH    = subprocess.getoutput(
     "nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.'"
 )
@@ -45,9 +47,11 @@ def run(cmd, **kw):
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           text=True, **kw)
 
-def compile_pair(src, out_normal, out_instrumented):
+def compile_pair(src, out_normal, out_instrumented, rdynamic=False):
     """Compile one source file into a normal and an instrumented binary."""
     common = BASE_FLAGS + [src]
+    if rdynamic:
+        common = common + ["-rdynamic"]
 
     r = run([CLANG] + common + ["-o", out_normal])
     if r.returncode != 0:
@@ -134,22 +138,151 @@ def compare_pagelogs(baseline_path, current_path):
         return False, f"cluster layout differs ({len(b_sizes)} vs {len(c_sizes)} allocs)"
     return True, f"{c_total} pages, {len(c_sizes)} alloc(s)"
 
+def parse_results_md(path):
+    """Parse a results markdown file and return a dict of kernel -> {clean, tracked, overhead, baseline}."""
+    results = {}
+    with open(path, "r") as f:
+        lines = f.readlines()
+
+    # Find the table (skip header lines until we see the separator)
+    in_table = False
+    for i, line in enumerate(lines):
+        if line.startswith("| :---"):
+            in_table = True
+            continue
+        if in_table and line.startswith("|") and "Kernel" not in line:
+            # Parse row: | Kernel | Strategy | Clean | Tracked | Overhead | Baseline |
+            parts = [p.strip() for p in line.split("|")[1:-1]]
+            if len(parts) >= 5:
+                name = parts[0]
+                clean = parts[2]
+                tracked = parts[3]
+                overhead = parts[4]
+                baseline = parts[5] if len(parts) > 5 else ""
+                results[name] = {
+                    "clean": clean,
+                    "tracked": tracked,
+                    "overhead": overhead,
+                    "baseline": baseline,
+                }
+    return results
+
+def diff_results(file1, file2):
+    """Compare two result markdown files and print differences."""
+    print(f"── Diffing results: {file1} vs {file2} ────────────────────────────────────────")
+
+    if not os.path.exists(file1):
+        print(f"Error: {file1} not found")
+        sys.exit(1)
+    if not os.path.exists(file2):
+        print(f"Error: {file2} not found")
+        sys.exit(1)
+
+    r1 = parse_results_md(file1)
+    r2 = parse_results_md(file2)
+
+    all_kernels = sorted(set(r1.keys()) | set(r2.keys()))
+
+    print(f"\n{'Kernel':<14} | {'File1':<30} | {'File2':<30} | {'Diff'}")
+    print("-" * 100)
+
+    diff_count = 0
+    for kernel in all_kernels:
+        d1 = r1.get(kernel, {})
+        d2 = r2.get(kernel, {})
+
+        v1 = d1.get("overhead", "N/A")
+        v2 = d2.get("overhead", "N/A")
+
+        # Try to parse as float for comparison
+        try:
+            f1 = float(v1.replace("%", ""))
+            try:
+                f2 = float(v2.replace("%", ""))
+                diff = f2 - f1
+                diff_str = f"{diff:+.2f}%"
+            except:
+                diff_str = "N/A"
+        except:
+            diff_str = "N/A"
+
+        if v1 != v2:
+            diff_count += 1
+            marker = "←"
+        else:
+            marker = "="
+
+        print(f"{kernel:<14} | {v1:<30} | {v2:<30} | {marker} {diff_str}")
+
+    print("-" * 100)
+    print(f"Total differences: {diff_count}/{len(all_kernels)} kernels")
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    force_rebuild     = "--rebuild"           in sys.argv
-    gen_baseline      = "--generate-baseline" in sys.argv
-    check_pagelogs = "--check" in sys.argv
+    parser = argparse.ArgumentParser(
+        description="UVM Access Tracking Benchmark Runner",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python3 benchmark.py                           # Run benchmarks, output to results.md
+  python3 benchmark.py results.md                # Custom output filename
+  python3 benchmark.py --rebuild                 # Force rebuild binaries
+  python3 benchmark.py --generate-baseline       # Generate baseline pagelogs
+  python3 benchmark.py --preload                 # Use LD_PRELOAD for malloc intercept
+  python3 benchmark.py --check                   # Run pagelog correctness checks
+  python3 benchmark.py --diff a.md b.md          # Diff two result files
+        """
+    )
+    parser.add_argument("output_file", nargs="?", default="results.md",
+                        help="Output markdown filename (default: results.md)")
+    parser.add_argument("--rebuild", action="store_true",
+                        help="Force rebuild of all binaries")
+    parser.add_argument("--generate-baseline", action="store_true",
+                        help="Generate baseline pagelogs for correctness checking")
+    parser.add_argument("--check", action="store_true",
+                        help="Run pagelog correctness checks after benchmarks")
+    parser.add_argument("--preload", action="store_true",
+                        help="Use LD_PRELOAD for malloc intercept")
+    parser.add_argument("--diff", nargs=2, metavar=("FILE1", "FILE2"),
+                        help="Diff two result markdown files")
 
-    # Parse optional output markdown filename
-    md_filename = "results.md"
-    args = [arg for arg in sys.argv[1:] if not arg.startswith("--")]
-    if args:
-        md_filename = args[0]
+    args = parser.parse_args()
+
+    # Handle diff mode early
+    if args.diff:
+        diff_results(args.diff[0], args.diff[1])
+        return
+
+    force_rebuild     = args.rebuild
+    gen_baseline      = args.generate_baseline
+    check_pagelogs    = args.check
+    use_preload       = args.preload
+    md_filename       = args.output_file
 
     os.makedirs(LOG_DIR,      exist_ok=True)
     os.makedirs("build",      exist_ok=True)
     if gen_baseline:
         os.makedirs(BASELINE_DIR, exist_ok=True)
+
+    # ── Build preload library if needed ────────────────────────────────────────
+    if use_preload:
+        print("── Preload mode enabled ─────────────────────────────────────────────-")
+        if not os.path.exists(PRELOAD_SO) or force_rebuild:
+            print(f"  Building {PRELOAD_SO}...", end=" ", flush=True)
+            r = run([
+                "clang++-20", "-shared", "-fPIC", "-O2",
+                f"-I{CUDA_PATH}/include",
+                "libMallocIntercept.cpp",
+                "-o", PRELOAD_SO,
+                "-ldl"
+            ])
+            if r.returncode != 0:
+                print("FAILED")
+                print(r.stderr[-2000:])
+                sys.exit(1)
+            print("ok")
+        else:
+            print(f"  {PRELOAD_SO}: up-to-date")
 
     # ── Compile phase ──────────────────────────────────────────────────────────
     sources  = sorted({src for _, src, _, _ in BENCHMARKS})
@@ -170,10 +303,13 @@ def main():
             os.path.getmtime(instrumented_bin) if os.path.exists(instrumented_bin) else 0,
         )
         needs_build = force_rebuild or (max(src_mtime, pass_mtime, lib_mtime) > bin_mtime)
+        # Rebuild if preload flag changed the required flags
+        if use_preload and not os.path.exists(normal_bin):
+            needs_build = True
 
         if needs_build:
             print(f"  Building {stem}...", end=" ", flush=True)
-            ok = compile_pair(src, normal_bin, instrumented_bin)
+            ok = compile_pair(src, normal_bin, instrumented_bin, rdynamic=use_preload)
             print("ok" if ok else "FAILED")
             if not ok:
                 print("Aborting.")
@@ -190,7 +326,7 @@ def main():
             print(f"  {name:<12}", end=" ", flush=True)
 
             cmd_i = [f"./{instrumented_bin}"] + ([str(kid)] if kid is not None else [])
-            out_i = run(cmd_i)
+            out_i = run(cmd_i, env=preload_env)
 
             if out_i.returncode != 0:
                 print("FAILED (binary error)")
@@ -211,6 +347,11 @@ def main():
     print("\n── Running benchmarks ────────────────────────────────────────────────")
     results = []  # (name, strategy, t_clean, t_track, overhead, baseline_ok, baseline_detail)
 
+    preload_env = None
+    if use_preload:
+        preload_env = os.environ.copy()
+        preload_env["LD_PRELOAD"] = os.path.abspath(PRELOAD_SO)
+
     for name, src, kid, strategy in BENCHMARKS:
         normal_bin, instrumented_bin = binaries[src]
         log_path      = os.path.join(LOG_DIR, f"{name.lower()}.log")
@@ -220,8 +361,8 @@ def main():
 
         cmd_n = [f"./{normal_bin}"]       + ([str(kid)] if kid is not None else [])
         cmd_i = [f"./{instrumented_bin}"] + ([str(kid)] if kid is not None else [])
-        out_n = run(cmd_n)
-        out_i = run(cmd_i)
+        out_n = run(cmd_n, env=preload_env)
+        out_i = run(cmd_i, env=preload_env)
 
         if os.path.exists("access_log.bin"):
             os.rename("access_log.bin", pagelog_path)

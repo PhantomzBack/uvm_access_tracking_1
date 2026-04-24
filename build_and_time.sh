@@ -13,16 +13,40 @@ OTHER_LIBRARIES="-lcudart -lcublas"
 
 # Check if a filename was provided
 if [ "$#" -lt 1 ]; then
-    echo "Usage: $0 <source_file.cu> [--run]"
+    echo "Usage: $0 <source_file.cu> [--run] [--preload]"
     exit 1
 fi
 
 SOURCE_INPUT=$1
 RUN_BENCHMARK=false
+USE_PRELOAD=false
 
-# Check for run flag
-if [[ "$*" == *"--run"* ]]; then
-    RUN_BENCHMARK=true
+# Parse flags
+for arg in "$@"; do
+    if [ "$arg" == "--run" ]; then
+        RUN_BENCHMARK=true
+    fi
+    if [ "$arg" == "--preload" ]; then
+        USE_PRELOAD=true
+    fi
+done
+
+# Preload shared library
+PRELOAD_SO="./libMallocIntercept.so"
+LD_PRELOAD_CMD=""
+if [ "$USE_PRELOAD" = true ]; then
+    echo "--- Preload mode enabled ---"
+    if [ ! -f "$PRELOAD_SO" ]; then
+        echo "Building $PRELOAD_SO ..."
+        clang++-20 -shared -fPIC -O2 -I"$CUDA_PATH/include" libMallocIntercept.cpp -o "$PRELOAD_SO" -ldl
+        if [ $? -ne 0 ]; then
+            echo "Error building $PRELOAD_SO"
+            exit 1
+        fi
+    fi
+    LD_PRELOAD_CMD="LD_PRELOAD=$PRELOAD_SO"
+    # -rdynamic makes executable symbols visible to the LD_PRELOAD wrapper
+    ADDITIONAL_FLAGS="$ADDITIONAL_FLAGS -rdynamic"
 fi
 
 # 1. Copy the provided file to the target location
@@ -77,16 +101,26 @@ if [ "$RUN_BENCHMARK" = true ]; then
 
     # Function to get time in seconds using 'time'
     # We use 'format %e' to get real elapsed time
-    TIME_CMD="time -f %e"
+    TIME_CMD="/usr/bin/time -f %e"
 
     echo "Running Normal..."
-    TIME_NORMAL=$($TIME_CMD ./$EXE_NORMAL 2>&1 >/dev/null)
+    TIME_NORMAL=$(
+        if [ "$USE_PRELOAD" = true ]; then
+            export LD_PRELOAD="$PRELOAD_SO"
+        fi
+        $TIME_CMD ./$EXE_NORMAL 2>&1 >/dev/null
+    )
     
     echo "Running Instrumented..."
-    TIME_INST=$($TIME_CMD ./$EXE_INSTRUMENTED 2>&1 >/dev/null)
+    TIME_INST=$(
+        if [ "$USE_PRELOAD" = true ]; then
+            export LD_PRELOAD="$PRELOAD_SO"
+        fi
+        $TIME_CMD ./$EXE_INSTRUMENTED 2>&1 >/dev/null
+    )
 
-    # Calculate ratio using bc
-    RATIO=$(echo "scale=4; $TIME_INST / $TIME_NORMAL" | bc)
+    # Calculate ratio using awk (bc may not be installed)
+    RATIO=$(awk "BEGIN {printf \"%.4f\", $TIME_INST / $TIME_NORMAL}")
 
     echo "--------------------------"
     echo "Normal Time:       ${TIME_NORMAL}s"

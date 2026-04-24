@@ -1,5 +1,10 @@
 #include "common.h"
 #include "tracking.h"
+#include <mutex>
+
+// ── Host-accessible globals for LD_PRELOAD wrapper ────────────────────────────
+extern "C" void** g_uvm_shadow_l1 = nullptr;
+
 // ── Device globals ────────────────────────────────────────────────────────────
 extern "C" {
     // shadow_l1 points to the L1 table (array of 512 void** pointers)
@@ -273,7 +278,82 @@ void init_tracking(void**** d_l1_ptr)
         LOG("[init_tracking] shadow_l1 readback successful\n");
     }
 
+    g_uvm_shadow_l1 = (void**)temp;
     CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+// ── Host: pre-populate shadow page table for a given VA range ─────────────────
+// Called by the LD_PRELOAD wrapper after cudaMallocManaged / cudaMalloc so that
+// GPU-side MarkAccess never has to call malloc() for the L2/L3 structures that
+// cover this allocation.
+extern "C" void uvm_tracking_preload_range(uintptr_t start, size_t size)
+{
+    if (!g_uvm_shadow_l1 || !start || size == 0)
+        return;
+
+    static std::mutex preload_mutex;
+    std::lock_guard<std::mutex> lock(preload_mutex);
+
+    uintptr_t end = start + size - 1;
+    uint32_t l1_start = (uint32_t)((start >> L1_SHIFT) & L1_MASK);
+    uint32_t l1_end   = (uint32_t)((end   >> L1_SHIFT) & L1_MASK);
+
+    // Read L1 table to host
+    void** h_l1[L1_ENTRIES];
+    cudaError_t err = cudaMemcpy(h_l1, g_uvm_shadow_l1,
+                                 L1_ENTRIES * sizeof(void**),
+                                 cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[uvm_tracking_preload_range] cudaMemcpy L1 failed: %s\n",
+                cudaGetErrorString(err));
+        return;
+    }
+
+    for (uint32_t li = l1_start; li <= l1_end; ++li) {
+        if (!h_l1[li]) {
+            void** new_l2 = nullptr;
+            err = cudaMalloc(&new_l2, L2_ENTRIES * sizeof(void*));
+            if (err != cudaSuccess) {
+                fprintf(stderr,
+                        "[uvm_tracking_preload_range] cudaMalloc L2 failed: %s\n",
+                        cudaGetErrorString(err));
+                return;
+            }
+            cudaMemset(new_l2, 0, L2_ENTRIES * sizeof(void*));
+            cudaMemcpy(&g_uvm_shadow_l1[li], &new_l2, sizeof(void**),
+                       cudaMemcpyHostToDevice);
+            h_l1[li] = new_l2;
+        }
+
+        uint32_t l2_start = (li == l1_start)
+                                ? (uint32_t)((start >> L2_SHIFT) & L2_MASK)
+                                : 0;
+        uint32_t l2_end   = (li == l1_end)
+                                ? (uint32_t)((end >> L2_SHIFT) & L2_MASK)
+                                : (L2_ENTRIES - 1);
+
+        // Read L2 table
+        void* h_l2[L2_ENTRIES];
+        cudaMemcpy(h_l2, h_l1[li], L2_ENTRIES * sizeof(void*),
+                   cudaMemcpyDeviceToHost);
+
+        for (uint32_t lj = l2_start; lj <= l2_end; ++lj) {
+            if (!h_l2[lj]) {
+                void* new_l3 = nullptr;
+                err = cudaMalloc(&new_l3, L3_BYTES);
+                if (err != cudaSuccess) {
+                    fprintf(stderr,
+                            "[uvm_tracking_preload_range] cudaMalloc L3 failed: %s\n",
+                            cudaGetErrorString(err));
+                    return;
+                }
+                cudaMemset(new_l3, 0, L3_BYTES);
+                cudaMemcpy(&((void**)h_l1[li])[lj], &new_l3, sizeof(void*),
+                           cudaMemcpyHostToDevice);
+                h_l2[lj] = new_l3;
+            }
+        }
+    }
 }
 
 // ── Host: walk the page table and dump accessed addresses ────────────────────
