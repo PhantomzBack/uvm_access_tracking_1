@@ -9,7 +9,7 @@ INCLUDE_DIR="-I./include -I../cutlass/include"
 LIB_SRC="./libMarkAccess.cu"
 CTL_SRC="./uvm_control_thread.cu"
 TARGET_FILE="../examples/benchmark_kernel_single.cu"
-OTHER_LIBRARIES="-lcudart -lcublas"
+OTHER_LIBRARIES="-lcudart"
 
 # Detect GPU architecture dynamically
 GPU_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')

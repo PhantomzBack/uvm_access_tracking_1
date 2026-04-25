@@ -117,12 +117,12 @@ int main(int argc, char** argv) {
     float ms = 0;
     cudaEventElapsedTime(&ms, start, stop);
     std::cout << "BENCHMARK_TIME: " << ms << " ms" << std::endl;
-
+    cudaFree(d_in); cudaFree(d_out); cudaFree(d_indices);
 #ifdef TRACKING_ENABLED
     export_binary(d_l1, "access_log.bin");
     cudaFree(d_l1);
 #endif
 
-    cudaFree(d_in); cudaFree(d_out); cudaFree(d_indices);
+    
     return 0;
 }

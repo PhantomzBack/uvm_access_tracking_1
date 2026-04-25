@@ -16,9 +16,10 @@ CLANG        = "clang++-20"
 LOG_DIR      = "bench_logs"
 BASELINE_DIR = "baselines"
 PRELOAD_SO   = "./libMallocIntercept.so"
-SM_ARCH    = subprocess.getoutput(
-    "nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.'"
-)
+SM_ARCH      = "61"
+# SM_ARCH    = subprocess.getoutput(
+#     "nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.'"
+# )
 BASE_FLAGS = [
     "-x", "cuda", f"--cuda-gpu-arch=sm_{SM_ARCH}",
     "-fgpu-rdc", "-O2", "-I./include",
@@ -79,8 +80,16 @@ def compile_pair(src, out_normal, out_instrumented, rdynamic=False, mode=0):
     return True
 
 def extract_time(output):
-    m = re.search(r"BENCHMARK_TIME: ([\d.]+)", output)
-    return float(m.group(1)) if m else None
+    patterns = [
+        r"BENCHMARK_TIME:\s*([\d.]+)",     # your format
+        r"GPU(?:\s+Runtime)?[:\s]+([\d.]+)"  # matches "GPU: 0.123" or "GPU Runtime: 0.123"
+    ]
+    
+    for pat in patterns:
+        m = re.search(pat, output)
+        if m:
+            return float(m.group(1))
+    return None
 
 # ── Pagelog helpers ───────────────────────────────────────────────────────────
 _HEADER_FMT = "<IHHHHIIIQ"   # magic, version, l1_entries, l2_entries, l3_bytes,
@@ -223,6 +232,38 @@ def diff_results(file1, file2):
     print("-" * 100)
     print(f"Total differences: {diff_count}/{len(all_kernels)} kernels")
 
+def safe_slug(path):
+    # Make a filesystem-safe unique name from a source path relative to examples/
+    rel = os.path.relpath(os.path.normpath(path), "examples")
+    rel = os.path.splitext(rel)[0]
+    rel = rel.replace(os.sep, "_")
+    rel = re.sub(r"[^A-Za-z0-9_.-]+", "_", rel)
+    return rel
+
+def find_cu_files(root="examples"):
+    cu_files = []
+    skip_files = {
+        "needle_kernel.cu",   # add more here if needed
+        "sgemm_cutlass.cu"
+        "test_kernel.cu"
+        "test_kernel_loop.cu"
+        }
+    for dirpath, _, filenames in os.walk(root):
+        for f in filenames:
+            if f.endswith(".cu") and f not in skip_files:
+                cu_files.append(os.path.normpath(os.path.join(dirpath, f)))
+    return sorted(cu_files)
+
+def extract_time(output):
+    # Take the LAST timing occurrence, because some benchmarks print timing more than once.
+    pattern = re.compile(
+        r"BENCHMARK_TIME:\s*([\d.eE+-]+)|GPU(?:\s+Runtime)?[:\s]+([\d.eE+-]+)"
+    )
+    last = None
+    for m in pattern.finditer(output):
+        last = m.group(1) or m.group(2)
+    return float(last) if last is not None else None
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
@@ -264,7 +305,6 @@ Examples:
 
     args = parser.parse_args()
 
-    # Handle diff mode early
     if args.diff:
         diff_results(args.diff[0], args.diff[1])
         return
@@ -285,10 +325,16 @@ Examples:
     if tracking_mode in (1, 2):
         use_preload = True
 
-    os.makedirs(LOG_DIR,      exist_ok=True)
-    os.makedirs("build",      exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs("build", exist_ok=True)
     if gen_baseline:
         os.makedirs(BASELINE_DIR, exist_ok=True)
+
+    # Build preload env early so both baseline mode and run mode can use it
+    preload_env = None
+    if use_preload:
+        preload_env = os.environ.copy()
+        preload_env["LD_PRELOAD"] = os.path.abspath(PRELOAD_SO)
 
     # ── Build preload library if needed ────────────────────────────────────────
     if use_preload:
@@ -310,30 +356,48 @@ Examples:
         else:
             print(f"  {PRELOAD_SO}: up-to-date")
 
-    # ── Compile phase ──────────────────────────────────────────────────────────
-    sources  = sorted({src for _, src, _, _ in BENCHMARKS})
-    binaries = {}  # src → (normal_bin, instrumented_bin)
+    # ── Build benchmark list: original + auto-discovered .cu files ─────────────
+    existing_sources = {os.path.normpath(src) for _, src, _, _ in BENCHMARKS}
+    auto_benchmarks = []
+
+    for src in find_cu_files("examples"):
+        src = os.path.normpath(src)
+        if src not in existing_sources:
+            # Unique display name derived from path, so files in different folders do not collide.
+            name = safe_slug(src)
+            auto_benchmarks.append((name, src, None, ""))
+
+    benchmarks = [
+        (name, os.path.normpath(src), kid, strategy)
+        for (name, src, kid, strategy) in (BENCHMARKS + auto_benchmarks)
+    ]
+    print("\nFinal benchmark sources:")
+    for _, src, _, _ in benchmarks:
+        print(src)
+    # Build source set from the combined benchmark list
+    sources = sorted({src for _, src, _, _ in benchmarks})
+    binaries = {}  # src -> (normal_bin, instrumented_bin)
 
     print("── Compiling ─────────────────────────────────────────────────────────")
     for src in sources:
-        stem = os.path.splitext(os.path.basename(src))[0]
-        normal_bin       = f"build/{stem}Normal"
+        stem = safe_slug(src)
+        normal_bin = f"build/{stem}Normal"
         # Include mode in instrumented binary name so mode changes don't require --rebuild
         if tracking_mode == 0:
             instrumented_bin = f"build/{stem}Instrumented"
         else:
             instrumented_bin = f"build/{stem}Instrumented_mode{tracking_mode}"
-        binaries[src]    = (normal_bin, instrumented_bin)
+        binaries[src] = (normal_bin, instrumented_bin)
 
         src_mtime  = os.path.getmtime(src) if os.path.exists(src) else 0
         pass_mtime = os.path.getmtime(PASS_PATH) if os.path.exists(PASS_PATH) else 0
-        lib_mtime  = os.path.getmtime(LIB_PATH)  if os.path.exists(LIB_PATH)  else 0
+        lib_mtime  = os.path.getmtime(LIB_PATH) if os.path.exists(LIB_PATH) else 0
         bin_mtime  = min(
-            os.path.getmtime(normal_bin)       if os.path.exists(normal_bin)       else 0,
+            os.path.getmtime(normal_bin) if os.path.exists(normal_bin) else 0,
             os.path.getmtime(instrumented_bin) if os.path.exists(instrumented_bin) else 0,
         )
         needs_build = force_rebuild or (max(src_mtime, pass_mtime, lib_mtime) > bin_mtime)
-        # Rebuild if preload flag changed the required flags
+
         if use_preload and not os.path.exists(normal_bin):
             needs_build = True
 
@@ -351,7 +415,8 @@ Examples:
     # ── Generate-baseline mode ─────────────────────────────────────────────────
     if gen_baseline:
         print("\n── Generating baselines ──────────────────────────────────────────────")
-        for name, src, kid, strategy in BENCHMARKS:
+        for name, src, kid, strategy in benchmarks:
+            src = os.path.normpath(src)
             _, instrumented_bin = binaries[src]
             baseline_path = os.path.join(BASELINE_DIR, f"{name.lower()}.pagelog")
             print(f"  {name:<12}", end=" ", flush=True)
@@ -379,19 +444,22 @@ Examples:
 
     # ── Run phase ──────────────────────────────────────────────────────────────
     print("\n── Running benchmarks ────────────────────────────────────────────────")
-    results = []  # (name, strategy, t_clean, t_track, overhead, baseline_ok, baseline_detail)
+    results = []
 
-    preload_env = None
-    if use_preload:
-        preload_env = os.environ.copy()
-        preload_env["LD_PRELOAD"] = os.path.abspath(PRELOAD_SO)
+    for name, src, kid, strategy in benchmarks:
+        src = os.path.normpath(src)
+        # print("Looking for:", src)
+        # print("Available keys:", list(binaries.keys())[:5])
 
-    for name, src, kid, strategy in BENCHMARKS:
         normal_bin, instrumented_bin = binaries[src]
-        log_path      = os.path.join(LOG_DIR, f"{name.lower()}.log")
-        pagelog_path  = f"{name.lower()}.pagelog"
-        baseline_path = os.path.join(BASELINE_DIR, f"{name.lower()}.pagelog")
+        log_path      = os.path.join(LOG_DIR, f"{safe_slug(src)}.log")
+        pagelog_path  = os.path.join(LOG_DIR, f"{safe_slug(src)}.pagelog")
+        baseline_path = os.path.join(BASELINE_DIR, f"{safe_slug(src)}.pagelog")
+
         print(f"  {name:<12}", end=" ", flush=True)
+        extra_args = ["-mb", "1000"]
+        cmd_n = [f"./{normal_bin}"] + ([str(kid)] if kid is not None else []) + extra_args
+        cmd_i = [f"./{instrumented_bin}"] + ([str(kid)] if kid is not None else []) + extra_args
 
         cmd_n = [f"./{normal_bin}"]       + ([str(kid)] if kid is not None else [])
         cmd_i = [f"./{instrumented_bin}"] + ([str(kid)] if kid is not None else [])
@@ -453,7 +521,7 @@ Examples:
         else:
             bl_ok, bl_detail = False, "no pagelog generated"
 
-        if t_clean is not None and t_track is not None:
+        if t_clean is not None and t_track is not None and t_clean != 0:
             overhead = (t_track - t_clean) / t_clean * 100
             results.append((name, strategy, t_clean, t_track, overhead, bl_ok, bl_detail, page_count))
             marker = "✓" if overhead < 50 else ("~" if overhead < 200 else "✗")
