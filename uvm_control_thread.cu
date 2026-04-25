@@ -2,6 +2,25 @@
 #include "common.h"
 #include "tracking.h"
 
+// ── Device kernel: clear every L3 bitmap reachable from L1 ───────────────────
+// Runs entirely on the GPU so it works for L2 pointers that were allocated
+// by device-side malloc() (host cudaMemcpy cannot touch those).
+__global__ void uvm_clear_l3s_kernel(void** l1_table)
+{
+    int l1_idx = blockIdx.x;
+    if (l1_idx >= L1_ENTRIES || !l1_table[l1_idx]) return;
+
+    void** l2_table = (void**)l1_table[l1_idx];
+    for (int l2_idx = threadIdx.x; l2_idx < L2_ENTRIES; l2_idx += blockDim.x) {
+        void* l3 = l2_table[l2_idx];
+        if (l3) {
+            unsigned long long* bits = (unsigned long long*)l3;
+            for (int k = 0; k < L3_BYTES / 8; ++k)
+                bits[k] = 0ULL;
+        }
+    }
+}
+
 #ifndef __CUDA_ARCH__
 
 #include <thread>
@@ -88,30 +107,28 @@ static void drop_range(uintptr_t start, size_t len)
 #endif
 }
 
-// Walk the current page table and write a binary pagelog.
-// For modes 0/1 this uses the existing export_binary (copy kernels + cudaMemcpy).
-// For mode 2 it walks managed L1/L2 directly.
 // Clear all L3 bitmaps to zero while preserving L1/L2 structure.
+// Uses a device kernel so it works for L2 pointers allocated by device malloc().
 static void do_clear(void)
 {
     if (!g_uvm_shadow_l1) return;
 
-    std::vector<void**> h_l1(L1_ENTRIES);
-    cudaMemcpy(h_l1.data(), g_uvm_shadow_l1,
-               L1_ENTRIES * sizeof(void**), cudaMemcpyDeviceToHost);
-
-    for (int i = 0; i < L1_ENTRIES; i++) {
-        if (!h_l1[i]) continue;
-        std::vector<void*> h_l2(L2_ENTRIES);
-        cudaMemcpy(h_l2.data(), h_l1[i],
-                   L2_ENTRIES * sizeof(void*), cudaMemcpyDeviceToHost);
-        for (int j = 0; j < L2_ENTRIES; j++) {
-            if (h_l2[j]) {
-                cudaMemset(h_l2[j], 0, L3_BYTES);
-            }
-        }
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[uvm_ctl] do_clear: cudaDeviceSynchronize failed: %s\n",
+                cudaGetErrorString(err));
+        return;
     }
-    cudaDeviceSynchronize();
+
+    uvm_clear_l3s_kernel<<<L1_ENTRIES, 256>>>(g_uvm_shadow_l1);
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[uvm_ctl] do_clear: kernel sync failed: %s\n",
+                cudaGetErrorString(err));
+        return;
+    }
+
+    fprintf(stderr, "[uvm_ctl] cleared all L3 bitmaps\n");
 }
 
 static void do_snapshot(const char* path)
@@ -135,7 +152,7 @@ static void do_snapshot(const char* path)
 
 static void send_reply(int fd, const std::string& msg)
 {
-    (void)write(fd, msg.c_str(), msg.length());
+    (void)send(fd, msg.c_str(), msg.length(), MSG_NOSIGNAL);
 }
 
 static void process_command(const std::string& cmd, int client_fd)
