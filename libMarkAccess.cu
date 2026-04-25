@@ -463,6 +463,73 @@ extern "C" void uvm_tracking_preload_range(uintptr_t start, size_t size)
 #endif
 }
 
+// ── Host: drop a preloaded range from the shadow page table ──────────────────
+// Called by the LD_PRELOAD wrapper on cudaFree so we don't leak shadow
+// structures or report stale accesses after the allocation is gone.
+extern "C" void uvm_tracking_drop_range(uintptr_t start, size_t len)
+{
+    if (!g_uvm_shadow_l1 || len == 0) return;
+
+    uintptr_t end = start + len - 1;
+    uint32_t l1_s = (uint32_t)((start >> L1_SHIFT) & L1_MASK);
+    uint32_t l1_e = (uint32_t)((end   >> L1_SHIFT) & L1_MASK);
+
+#if UVM_TRACKING_MODE == 2
+    void*** l1 = (void***)g_uvm_shadow_l1;
+    for (uint32_t li = l1_s; li <= l1_e; ++li) {
+        if (!l1[li]) continue;
+        void** l2 = (void**)l1[li];
+        uint32_t l2_s = (li == l1_s) ? (uint32_t)((start >> L2_SHIFT) & L2_MASK) : 0;
+        uint32_t l2_e = (li == l1_e) ? (uint32_t)((end   >> L2_SHIFT) & L2_MASK) : (L2_ENTRIES - 1);
+        for (uint32_t lj = l2_s; lj <= l2_e; ++lj) {
+            if (l2[lj]) {
+                cudaFree(l2[lj]);   // L3 bitmap is device memory in all modes
+                l2[lj] = nullptr;
+            }
+        }
+    }
+#else
+    // Modes 0/1: L1/L2 are device memory.  Read them to host, null entries,
+    // write back, and free the L3 bitmaps.  We tolerate cudaMemcpy errors
+    // gracefully because some L2 tables may have been allocated by device-side
+    // malloc() and are invisible to host cudaMemcpy.
+    void** h_l1[L1_ENTRIES];
+    cudaError_t err = cudaMemcpy(h_l1, g_uvm_shadow_l1,
+                                 L1_ENTRIES * sizeof(void**),
+                                 cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[uvm_tracking_drop_range] cudaMemcpy L1 failed: %s\n",
+                cudaGetErrorString(err));
+        return;
+    }
+
+    for (uint32_t li = l1_s; li <= l1_e; ++li) {
+        if (!h_l1[li]) continue;
+        void* h_l2[L2_ENTRIES];
+        err = cudaMemcpy(h_l2, h_l1[li], L2_ENTRIES * sizeof(void*),
+                         cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "[uvm_tracking_drop_range] cudaMemcpy L2[%u] failed: %s\n",
+                    li, cudaGetErrorString(err));
+            continue;
+        }
+
+        uint32_t l2_s = (li == l1_s) ? (uint32_t)((start >> L2_SHIFT) & L2_MASK) : 0;
+        uint32_t l2_e = (li == l1_e) ? (uint32_t)((end   >> L2_SHIFT) & L2_MASK) : (L2_ENTRIES - 1);
+
+        for (uint32_t lj = l2_s; lj <= l2_e; ++lj) {
+            if (h_l2[lj]) {
+                cudaFree(h_l2[lj]);
+                h_l2[lj] = nullptr;
+            }
+        }
+        cudaMemcpy(h_l1[li], h_l2, L2_ENTRIES * sizeof(void*),
+                   cudaMemcpyHostToDevice);
+    }
+#endif
+}
+
 // ── Host: runtime toggles (used by control thread) ────────────────────────────
 extern "C" void uvm_tracking_set_enabled(int v)
 {

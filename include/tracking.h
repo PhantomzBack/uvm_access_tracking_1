@@ -9,6 +9,7 @@ void export_log(void*** d_l1, const char* filename); // function to export the t
 void export_binary(void*** d_l1, const char* filename); // function to export the tracking log from the device to a binary file in the specified format
 
 extern "C" void uvm_tracking_preload_range(uintptr_t start, size_t size);
+extern "C" void uvm_tracking_drop_range(uintptr_t start, size_t size);
 extern "C" void** g_uvm_shadow_l1;
 
 // Runtime toggles (used by control thread)

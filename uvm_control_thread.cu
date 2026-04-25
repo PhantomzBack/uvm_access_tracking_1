@@ -46,65 +46,16 @@ static std::atomic<bool>        g_ctl_running{false};
 static std::atomic<bool>        g_ctl_shutdown{false};
 static std::mutex               g_snapshot_mtx;
 
-struct DeferredL3 { void* ptr; };
-static std::vector<DeferredL3>  g_deferred;
-static std::mutex               g_deferred_mtx;
-
 // ── Helpers ──────────────────────────────────────────────────────────────────
 static inline void*** shadow_l1_ptr(void)
 {
     return (void***)g_uvm_shadow_l1;
 }
 
-// Mode-2: CPU directly nulls managed L2 entries and queues L3 for deferred free.
-// Modes 0/1: reads L2 to host, nulls entries, writes back, queues L3.
 static void drop_range(uintptr_t start, size_t len)
 {
     if (!g_uvm_shadow_l1 || len == 0) return;
-
-    uintptr_t end = start + len - 1;
-    uint32_t l1_s = (uint32_t)((start >> L1_SHIFT) & L1_MASK);
-    uint32_t l1_e = (uint32_t)((end   >> L1_SHIFT) & L1_MASK);
-
-#if UVM_TRACKING_MODE == 2
-    void*** l1 = shadow_l1_ptr();
-    for (uint32_t li = l1_s; li <= l1_e; ++li) {
-        if (!l1[li]) continue;
-        void** l2 = (void**)l1[li];
-        uint32_t l2_s = (li == l1_s) ? (uint32_t)((start >> L2_SHIFT) & L2_MASK) : 0;
-        uint32_t l2_e = (li == l1_e) ? (uint32_t)((end   >> L2_SHIFT) & L2_MASK) : (L2_ENTRIES - 1);
-        for (uint32_t lj = l2_s; lj <= l2_e; ++lj) {
-            if (l2[lj]) {
-                std::lock_guard<std::mutex> lock(g_deferred_mtx);
-                g_deferred.push_back({l2[lj]});
-                l2[lj] = nullptr;
-            }
-        }
-    }
-#else
-    void** h_l1[L1_ENTRIES];
-    cudaError_t err = cudaMemcpy(h_l1, g_uvm_shadow_l1,
-                                 L1_ENTRIES * sizeof(void**), cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) return;
-
-    for (uint32_t li = l1_s; li <= l1_e; ++li) {
-        if (!h_l1[li]) continue;
-        void* h_l2[L2_ENTRIES];
-        cudaMemcpy(h_l2, h_l1[li], L2_ENTRIES * sizeof(void*), cudaMemcpyDeviceToHost);
-
-        uint32_t l2_s = (li == l1_s) ? (uint32_t)((start >> L2_SHIFT) & L2_MASK) : 0;
-        uint32_t l2_e = (li == l1_e) ? (uint32_t)((end   >> L2_SHIFT) & L2_MASK) : (L2_ENTRIES - 1);
-
-        for (uint32_t lj = l2_s; lj <= l2_e; ++lj) {
-            if (h_l2[lj]) {
-                std::lock_guard<std::mutex> lock(g_deferred_mtx);
-                g_deferred.push_back({h_l2[lj]});
-                h_l2[lj] = nullptr;
-            }
-        }
-        cudaMemcpy(h_l1[li], h_l2, L2_ENTRIES * sizeof(void*), cudaMemcpyHostToDevice);
-    }
-#endif
+    uvm_tracking_drop_range(start, len);
 }
 
 // Clear all L3 bitmaps to zero while preserving L1/L2 structure.
@@ -141,13 +92,6 @@ static void do_snapshot(const char* path)
 
     // Reuse the existing export_binary — it already handles all three modes.
     export_binary(shadow_l1_ptr(), path);
-
-    // Process deferred free queue (freed now that GPU is synced inside export_binary)
-    std::lock_guard<std::mutex> df_lock(g_deferred_mtx);
-    for (auto& d : g_deferred) {
-        cudaFree(d.ptr);
-    }
-    g_deferred.clear();
 }
 
 static void send_reply(int fd, const std::string& msg)
@@ -210,10 +154,6 @@ static void process_command(const std::string& cmd, int client_fd)
         oss << "tracking_enabled: " << enabled << "\n";
         oss << "skip_on_miss: " << skip << "\n";
         oss << "shadow_l1: " << g_uvm_shadow_l1 << "\n";
-        {
-            std::lock_guard<std::mutex> lock(g_deferred_mtx);
-            oss << "deferred_l3: " << g_deferred.size() << "\n";
-        }
         send_reply(client_fd, oss.str());
     }
     else if (cmd == "CLEAR") {

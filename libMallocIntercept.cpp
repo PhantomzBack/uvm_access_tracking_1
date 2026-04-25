@@ -38,13 +38,14 @@ static cudaFree_t             real_cudaFree             = nullptr;
 static cudaDeviceSynchronize_t real_cudaDeviceSynchronize = nullptr;
 
 static void (*preload_range_fn)(uintptr_t, size_t) = nullptr;
+static void (*drop_range_fn)(uintptr_t, size_t)   = nullptr;
 static void**  g_shadow_l1_ptr                   = nullptr;
 
 // Control-thread symbols (resolved lazily from the main executable)
 static void (*start_ctl_fn)(void) = nullptr;
 static int*  g_preload_managed_ptr = nullptr;
 
-static std::mutex              g_mutex;
+static std::recursive_mutex    g_mutex;
 
 struct PendingAlloc {
     void*  ptr;
@@ -52,6 +53,12 @@ struct PendingAlloc {
     bool   is_managed;
 };
 static std::vector<PendingAlloc> g_pending;
+
+struct ActiveAlloc {
+    void*  ptr;
+    size_t size;
+};
+static std::vector<ActiveAlloc>  g_active;
 
 static bool                    g_init_done = false;
 static thread_local bool       g_in_preload = false;
@@ -73,6 +80,9 @@ static void ensure_init()
     preload_range_fn =
         (void (*)(uintptr_t, size_t))dlsym(RTLD_DEFAULT,
                                            "uvm_tracking_preload_range");
+    drop_range_fn =
+        (void (*)(uintptr_t, size_t))dlsym(RTLD_DEFAULT,
+                                           "uvm_tracking_drop_range");
     g_shadow_l1_ptr =
         (void**)dlsym(RTLD_DEFAULT, "g_uvm_shadow_l1");
 
@@ -110,7 +120,7 @@ static void process_pending()
 
     std::vector<PendingAlloc> to_process;
     {
-        std::lock_guard<std::mutex> lock(g_mutex);
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
         if (g_pending.empty()) return;
         to_process.swap(g_pending);
     }
@@ -120,6 +130,8 @@ static void process_pending()
         g_in_preload = true;
         preload_range_fn((uintptr_t)a.ptr, a.size);
         g_in_preload = false;
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
+        g_active.push_back({a.ptr, a.size});
     }
 }
 
@@ -137,11 +149,13 @@ static void register_alloc(void* ptr, size_t size, bool is_managed)
         g_in_preload = true;
         preload_range_fn((uintptr_t)ptr, size);
         g_in_preload = false;
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
+        g_active.push_back({ptr, size});
         return;
     }
 
     // Otherwise queue it for later (e.g. after init_tracking runs).
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     g_pending.push_back({ptr, size, is_managed});
 }
 
@@ -173,12 +187,28 @@ extern "C" cudaError_t cudaFree(void* ptr)
 {
     ensure_init();
     {
-        std::lock_guard<std::mutex> lock(g_mutex);
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
+        // Remove from pending queue (was never preloaded)
         for (auto it = g_pending.begin(); it != g_pending.end(); ) {
             if (it->ptr == ptr)
                 it = g_pending.erase(it);
             else
                 ++it;
+        }
+        // If we are freeing the L1 table itself, null the shadow pointer
+        // so that later drop_range calls bail out early.
+        if (g_shadow_l1_ptr && *g_shadow_l1_ptr == ptr) {
+            *g_shadow_l1_ptr = nullptr;
+        }
+        // Drop from shadow page table if it was preloaded
+        for (auto it = g_active.begin(); it != g_active.end(); ) {
+            if (it->ptr == ptr) {
+                if (drop_range_fn)
+                    drop_range_fn((uintptr_t)it->ptr, it->size);
+                it = g_active.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
     return real_cudaFree(ptr);
