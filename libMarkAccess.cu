@@ -1,10 +1,7 @@
 #include "common.h"
 #include "tracking.h"
+#include "uvm_control_thread.h"
 #include <mutex>
-
-#ifndef UVM_TRACKING_MODE
-#define UVM_TRACKING_MODE 0
-#endif
 
 // ── Host-accessible globals for LD_PRELOAD wrapper ────────────────────────────
 extern "C" void** g_uvm_shadow_l1 = nullptr;
@@ -341,6 +338,9 @@ void init_tracking(void**** d_l1_ptr)
 
     g_uvm_shadow_l1 = (void**)temp;
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Spawn background control thread for live enable/disable/snapshot
+    uvm_start_control_thread();
 }
 
 // ── Host: pre-populate shadow page table for a given VA range ─────────────────

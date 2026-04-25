@@ -7,6 +7,7 @@ PLUGIN="./build/UvmTrackingPass.so"
 ADDITIONAL_FLAGS="-fgpu-rdc -g -O2"
 INCLUDE_DIR="-I./include -I../cutlass/include"
 LIB_SRC="./libMarkAccess.cu"
+CTL_SRC="./uvm_control_thread.cu"
 TARGET_FILE="../examples/benchmark_kernel_single.cu"
 OTHER_LIBRARIES="-lcudart -lcublas"
 
@@ -107,7 +108,7 @@ $CLANG -x cuda --cuda-gpu-arch=$GPU_ARCH \
     $MODE_FLAG \
     -DTRACKING_ENABLED \
     -fpass-plugin=$PLUGIN \
-    "$SOURCE_INPUT" "$LIB_SRC" \
+    "$SOURCE_INPUT" "$LIB_SRC" "$CTL_SRC" \
     --cuda-path=$CUDA_PATH -L$CUDA_PATH/lib64 \
     -lcudart -lcublas -o "$EXE_INSTRUMENTED"
 

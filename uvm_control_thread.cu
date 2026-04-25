@@ -91,6 +91,29 @@ static void drop_range(uintptr_t start, size_t len)
 // Walk the current page table and write a binary pagelog.
 // For modes 0/1 this uses the existing export_binary (copy kernels + cudaMemcpy).
 // For mode 2 it walks managed L1/L2 directly.
+// Clear all L3 bitmaps to zero while preserving L1/L2 structure.
+static void do_clear(void)
+{
+    if (!g_uvm_shadow_l1) return;
+
+    std::vector<void**> h_l1(L1_ENTRIES);
+    cudaMemcpy(h_l1.data(), g_uvm_shadow_l1,
+               L1_ENTRIES * sizeof(void**), cudaMemcpyDeviceToHost);
+
+    for (int i = 0; i < L1_ENTRIES; i++) {
+        if (!h_l1[i]) continue;
+        std::vector<void*> h_l2(L2_ENTRIES);
+        cudaMemcpy(h_l2.data(), h_l1[i],
+                   L2_ENTRIES * sizeof(void*), cudaMemcpyDeviceToHost);
+        for (int j = 0; j < L2_ENTRIES; j++) {
+            if (h_l2[j]) {
+                cudaMemset(h_l2[j], 0, L3_BYTES);
+            }
+        }
+    }
+    cudaDeviceSynchronize();
+}
+
 static void do_snapshot(const char* path)
 {
     if (!g_uvm_shadow_l1) {
@@ -175,6 +198,10 @@ static void process_command(const std::string& cmd, int client_fd)
             oss << "deferred_l3: " << g_deferred.size() << "\n";
         }
         send_reply(client_fd, oss.str());
+    }
+    else if (cmd == "CLEAR") {
+        do_clear();
+        send_reply(client_fd, "OK\n");
     }
     else if (cmd == "SHUTDOWN") {
         send_reply(client_fd, "OK\n");

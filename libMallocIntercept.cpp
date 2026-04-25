@@ -40,8 +40,19 @@ static cudaDeviceSynchronize_t real_cudaDeviceSynchronize = nullptr;
 static void (*preload_range_fn)(uintptr_t, size_t) = nullptr;
 static void**  g_shadow_l1_ptr                   = nullptr;
 
+// Control-thread symbols (resolved lazily from the main executable)
+static void (*start_ctl_fn)(void) = nullptr;
+static int*  g_preload_managed_ptr = nullptr;
+
 static std::mutex              g_mutex;
-static std::vector<std::pair<void*, size_t>> g_pending;
+
+struct PendingAlloc {
+    void*  ptr;
+    size_t size;
+    bool   is_managed;
+};
+static std::vector<PendingAlloc> g_pending;
+
 static bool                    g_init_done = false;
 static thread_local bool       g_in_preload = false;
 
@@ -65,7 +76,16 @@ static void ensure_init()
     g_shadow_l1_ptr =
         (void**)dlsym(RTLD_DEFAULT, "g_uvm_shadow_l1");
 
+    // Resolve control-thread symbols (may be absent if binary lacks uvm_control_thread)
+    start_ctl_fn =
+        (void (*)(void))dlsym(RTLD_DEFAULT, "uvm_start_control_thread");
+    g_preload_managed_ptr =
+        (int*)dlsym(RTLD_DEFAULT, "g_uvm_preload_managed");
+
     g_init_done = true;
+
+    // Spawn control thread if available (idempotent)
+    if (start_ctl_fn) start_ctl_fn();
 }
 
 // ── Helper: is the shadow L1 table already initialised? ──────────────────────
@@ -75,13 +95,20 @@ static bool shadow_l1_ready()
     return *g_shadow_l1_ptr != nullptr;
 }
 
+// ── Helper: should we preload a managed allocation? ──────────────────────────
+static bool should_preload_managed()
+{
+    if (!g_preload_managed_ptr) return true;  // default: yes
+    return *g_preload_managed_ptr != 0;
+}
+
 // ── Helper: process any pending allocations ──────────────────────────────────
 static void process_pending()
 {
     if (!preload_range_fn) return;
     if (!shadow_l1_ready()) return;
 
-    std::vector<std::pair<void*, size_t>> to_process;
+    std::vector<PendingAlloc> to_process;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (g_pending.empty()) return;
@@ -89,17 +116,21 @@ static void process_pending()
     }
 
     for (auto& a : to_process) {
+        if (a.is_managed && !should_preload_managed()) continue;
         g_in_preload = true;
-        preload_range_fn((uintptr_t)a.first, a.second);
+        preload_range_fn((uintptr_t)a.ptr, a.size);
         g_in_preload = false;
     }
 }
 
 // ── Helper: register a new allocation ────────────────────────────────────────
-static void register_alloc(void* ptr, size_t size)
+static void register_alloc(void* ptr, size_t size, bool is_managed)
 {
     if (!ptr || size == 0) return;
     if (g_in_preload) return;          // prevent recursion
+
+    // Skip managed pre-population if toggled off
+    if (is_managed && !should_preload_managed()) return;
 
     // If the page table is already up, pre-populate immediately.
     if (preload_range_fn && shadow_l1_ready()) {
@@ -111,7 +142,7 @@ static void register_alloc(void* ptr, size_t size)
 
     // Otherwise queue it for later (e.g. after init_tracking runs).
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_pending.emplace_back(ptr, size);
+    g_pending.push_back({ptr, size, is_managed});
 }
 
 // ── Intercepted cudaMallocManaged ────────────────────────────────────────────
@@ -121,7 +152,7 @@ extern "C" cudaError_t cudaMallocManaged(void** ptr, size_t size,
     ensure_init();
     cudaError_t err = real_cudaMallocManaged(ptr, size, flags);
     if (err == cudaSuccess) {
-        register_alloc(*ptr, size);
+        register_alloc(*ptr, size, true);
     }
     return err;
 }
@@ -132,7 +163,7 @@ extern "C" cudaError_t cudaMalloc(void** ptr, size_t size)
     ensure_init();
     cudaError_t err = real_cudaMalloc(ptr, size);
     if (err == cudaSuccess) {
-        register_alloc(*ptr, size);
+        register_alloc(*ptr, size, false);
     }
     return err;
 }
@@ -144,7 +175,7 @@ extern "C" cudaError_t cudaFree(void* ptr)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         for (auto it = g_pending.begin(); it != g_pending.end(); ) {
-            if (it->first == ptr)
+            if (it->ptr == ptr)
                 it = g_pending.erase(it);
             else
                 ++it;

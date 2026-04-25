@@ -8,6 +8,10 @@
 #pragma once
 
 // ── Common definitions and utilities ───────────────────────────────────────────
+#ifndef UVM_TRACKING_MODE
+#define UVM_TRACKING_MODE 0
+#endif
+
 #define DBG printf("At line: %d\n", __LINE__);
 #define DBG_RET(ret) printf("At line: %d, returning %d\n", __LINE__, ret); return ret;
 // #define DEBUG

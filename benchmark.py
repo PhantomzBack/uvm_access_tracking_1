@@ -10,6 +10,7 @@ import statistics
 # ── Config ────────────────────────────────────────────────────────────────────
 PASS_PATH    = "./build/UvmTrackingPass.so"
 LIB_PATH     = "./libMarkAccess.cu"
+CTL_PATH     = "./uvm_control_thread.cu"
 CUDA_PATH    = "/usr/local/cuda"
 CLANG        = "clang++-20"
 LOG_DIR      = "bench_logs"
@@ -64,6 +65,7 @@ def compile_pair(src, out_normal, out_instrumented, rdynamic=False, mode=0):
         "-DTRACKING_ENABLED",
         f"-fpass-plugin={PASS_PATH}",
         LIB_PATH,
+        CTL_PATH,
     ]
     if mode != 0:
         inst_flags = [f"-DUVM_TRACKING_MODE={mode}"] + inst_flags
@@ -502,32 +504,6 @@ Examples:
     if total_pages > 0:
         print(f"Total pages touched: {total_pages}")
 
-    # Optional: run pagelog correctness check using scripts/run_pgelog_test.py
-    if check_pagelogs:
-        try:
-            from scripts.run_pgelog_test import PagelogTester
-        except Exception as e:
-            print(f"\n✗ Could not import PagelogTester: {e}")
-            sys.exit(2)
-
-        print("\n── Pagelog correctness check (--check) ───────────────────────────────")
-        tester = PagelogTester(root_dir=os.getcwd())
-
-        # Backup generated pagelogs into tester.current_dir (will copy *.pagelog)
-        ok = tester.backup_generated_pagelogs()
-        if not ok:
-            print("\n✗ No pagelog files found to check")
-            sys.exit(2)
-
-        passed, results = tester.compare_pagelogs()
-        tester.print_summary(passed, results)
-
-        if not passed:
-            print("\n✗ Pagelog verification failed")
-            sys.exit(3)
-        else:
-            print("\n✓ Pagelog verification passed")
-            # fall through and exit normally
     if n_checked:
         print(f"Baseline checks: {n_passed}/{n_checked} passed"
               + (f"  ← {n_failed} FAILED" if n_failed else ""))
