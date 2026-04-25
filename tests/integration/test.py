@@ -10,130 +10,54 @@ For each mode (0=no-preload, 1=preload-alloc, 2=preload-only):
   4. Verifies page counts and toggle states.
 
 Usage:
-    python3 scripts/test_integration.py
+    python3 tests/integration/test.py
 """
 
-import subprocess
 import os
 import sys
-import socket
 import time
-import struct
 import tempfile
-import glob
 
-CUDA_PATH    = "/usr/local/cuda"
-CLANG        = "clang++-20"
-PASS_PATH    = "./build/UvmTrackingPass.so"
-PRELOAD_SO   = "./libMallocIntercept.so"
-TEST_BIN     = "./build/long_running_test"
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import harness
 
-SM_ARCH = subprocess.getoutput(
-    "nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.'"
-)
-
-
-def compile_test(mode):
-    print(f"\n{'='*60}")
-    print(f"Building long_running_test for mode {mode}")
-    print(f"{'='*60}")
-    cmd = [
-        CLANG, "-x", "cuda", f"--cuda-gpu-arch=sm_{SM_ARCH}",
-        "-fgpu-rdc", "-O2", "-I./include", "-rdynamic",
-        "-DTRACKING_ENABLED", f"-fpass-plugin={PASS_PATH}",
-    ]
-    if mode != 0:
-        cmd.append(f"-DUVM_TRACKING_MODE={mode}")
-    cmd += [
-        "examples/long_running_test.cu",
-        "libMarkAccess.cu", "uvm_control_thread.cu",
-        f"--cuda-path={CUDA_PATH}", f"-L{CUDA_PATH}/lib64", "-lcudart",
-        "-o", TEST_BIN,
-    ]
-    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if r.returncode != 0:
-        print("Build FAILED")
-        print(r.stderr[-2000:])
-        return False
-    print("Build OK")
-    return True
-
-
-def send_cmd(sock_path, cmd, timeout=2.0):
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(timeout)
-    s.connect(sock_path)
-    s.sendall((cmd + "\n").encode())
-    resp = b""
-    try:
-        while True:
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            resp += chunk
-    except socket.timeout:
-        pass
-    s.close()
-    return resp.decode()
-
-
-def count_pages(path):
-    if not os.path.exists(path):
-        return -1
-    with open(path, "rb") as f:
-        raw = f.read()
-    fmt = "<IHHHHIIIQ"
-    hdr_sz = struct.calcsize(fmt)
-    if len(raw) < hdr_sz:
-        return -1
-    magic, _, _, _, l3b, _, _, _, num_leaves = struct.unpack_from(fmt, raw)
-    if magic != 0x50474C47:
-        return -1
-    idx_fmt = "<HHQ"
-    idx_sz = struct.calcsize(idx_fmt)
-    pages = 0
-    for k in range(num_leaves):
-        l1, l2, off = struct.unpack_from(idx_fmt, raw, hdr_sz + k * idx_sz)
-        for w in range(l3b // 8):
-            word = struct.unpack_from("<Q", raw, off + w * 8)[0]
-            pages += bin(word).count("1")
-    return pages
+TEST_BIN = "./build/long_running_test_integration"
 
 
 def run_mode_test(mode):
-    if not compile_test(mode):
+    print(f"\n{'='*60}")
+    print(f"Building long_running_test for mode {mode}")
+    print(f"{'='*60}")
+
+    ok, stderr = harness.compile(
+        "tests/control_thread/long_running_test.cu", 
+        TEST_BIN, 
+        instrumented=True, 
+        mode=mode, 
+        rdynamic=True,
+        force=True # Ensure it recompiles for the specific mode
+    )
+    if not ok:
+        print("Build FAILED")
+        print(stderr[-2000:])
         return False
+    print("Build OK")
 
     # Rebuild wrapper to be safe
     print("\n── Building wrapper ──")
-    subprocess.run([
-        CLANG, "-shared", "-fPIC", "-O2", "-I./include",
-        "libMallocIntercept.cpp", "-o", PRELOAD_SO, "-ldl"
-    ], check=True)
+    harness.subprocess.run([
+        harness.CLANG, "-shared", "-fPIC", "-O2", f"-I{os.path.join(harness.ROOT, 'include')}",
+        "libMallocIntercept.cpp", "-o", harness.PRELOAD_SO, "-ldl"
+    ], check=True, cwd=harness.ROOT)
     print("Wrapper OK")
 
     print(f"\n── Starting long_running_test mode={mode} (8 s) ──")
-    env = os.environ.copy()
-    env["LD_PRELOAD"] = os.path.abspath(PRELOAD_SO)
-
-    proc = subprocess.Popen(
-        [TEST_BIN, "8"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, env=env,
-    )
-    time.sleep(0.5)
-
-    # Find socket
-    pid = proc.pid
-    sock = f"/tmp/uvm-ctl.{pid}"
-    if not os.path.exists(sock):
-        socks = glob.glob("/tmp/uvm-ctl.*")
-        if socks:
-            sock = socks[0]
-        else:
-            print("FAIL: no control socket found")
-            proc.kill()
-            return False
+    
+    try:
+        proc, sock = harness.launch_socket_binary(TEST_BIN, ["8"], with_preload=True)
+    except Exception as e:
+        print(f"FAIL: {e}")
+        return False
 
     print(f"Connected to {sock}")
 
@@ -142,73 +66,73 @@ def run_mode_test(mode):
     try:
         # ── Test 1: STATUS ──
         print("\n── Test 1: STATUS ──")
-        resp = send_cmd(sock, "STATUS")
+        resp = harness.send_socket_cmd(sock, "STATUS")
         print(resp)
         assert f"mode: {mode}" in resp, f"STATUS missing expected mode {mode}"
         print("PASS")
 
         # ── Test 2: DISABLE → work 1 s → SNAPSHOT A ──
         print("\n── Test 2: DISABLE → work 1 s → SNAPSHOT A ──")
-        print(send_cmd(sock, "DISABLE"), end="")
+        print(harness.send_socket_cmd(sock, "DISABLE"), end="")
         time.sleep(1.2)
         snap_a = tempfile.mktemp(suffix=".pglog")
         temps.append(snap_a)
-        print(send_cmd(sock, f"SNAPSHOT {snap_a}"), end="")
-        pages_a = count_pages(snap_a)
+        print(harness.send_socket_cmd(sock, f"SNAPSHOT {snap_a}"), end="")
+        pages_a = harness.count_pages(snap_a) if os.path.exists(snap_a) else -1
         print(f"Snapshot A pages: {pages_a}")
         print("PASS (data collected)")
 
         # ── Test 3: ENABLE → work 2 s → SNAPSHOT B ──
         print("\n── Test 3: ENABLE → work 2 s → SNAPSHOT B ──")
-        print(send_cmd(sock, "ENABLE"), end="")
+        print(harness.send_socket_cmd(sock, "ENABLE"), end="")
         time.sleep(2.2)
         snap_b = tempfile.mktemp(suffix=".pglog")
         temps.append(snap_b)
-        print(send_cmd(sock, f"SNAPSHOT {snap_b}"), end="")
-        pages_b = count_pages(snap_b)
+        print(harness.send_socket_cmd(sock, f"SNAPSHOT {snap_b}"), end="")
+        pages_b = harness.count_pages(snap_b)
         print(f"Snapshot B pages: {pages_b}")
         assert pages_b > 0, "Snapshot B should have pages (tracking was ON)"
         print("PASS")
 
         # ── Test 4: DISABLE → wait → CLEAR → work 1 s → SNAPSHOT C ──
         print("\n── Test 4: DISABLE → wait → CLEAR → work 1 s → SNAPSHOT C ──")
-        print(send_cmd(sock, "DISABLE"), end="")
+        print(harness.send_socket_cmd(sock, "DISABLE"), end="")
         time.sleep(0.5)
-        print(send_cmd(sock, "CLEAR"), end="")
+        print(harness.send_socket_cmd(sock, "CLEAR"), end="")
         time.sleep(1.5)
         snap_c = tempfile.mktemp(suffix=".pglog")
         temps.append(snap_c)
-        print(send_cmd(sock, f"SNAPSHOT {snap_c}"), end="")
-        pages_c = count_pages(snap_c)
+        print(harness.send_socket_cmd(sock, f"SNAPSHOT {snap_c}"), end="")
+        pages_c = harness.count_pages(snap_c)
         print(f"Snapshot C pages: {pages_c}")
         assert pages_c == 0, f"Snapshot C should be empty after DISABLE+CLEAR, got {pages_c}"
         print("PASS")
 
         # ── Test 5: RE-ENABLE → work 2 s → SNAPSHOT D ──
         print("\n── Test 5: RE-ENABLE → work 2 s → SNAPSHOT D ──")
-        print(send_cmd(sock, "ENABLE"), end="")
+        print(harness.send_socket_cmd(sock, "ENABLE"), end="")
         time.sleep(2.2)
         snap_d = tempfile.mktemp(suffix=".pglog")
         temps.append(snap_d)
-        print(send_cmd(sock, f"SNAPSHOT {snap_d}"), end="")
-        pages_d = count_pages(snap_d)
+        print(harness.send_socket_cmd(sock, f"SNAPSHOT {snap_d}"), end="")
+        pages_d = harness.count_pages(snap_d)
         print(f"Snapshot D pages: {pages_d}")
         assert pages_d > 0, "Snapshot D should have pages after re-enable"
         print("PASS")
 
         # ── Test 6: PRELOAD_MANAGED toggle ──
         print("\n── Test 6: PRELOAD_MANAGED toggle ──")
-        print(send_cmd(sock, "PRELOAD_MANAGED 0"), end="")
-        resp = send_cmd(sock, "STATUS")
+        print(harness.send_socket_cmd(sock, "PRELOAD_MANAGED 0"), end="")
+        resp = harness.send_socket_cmd(sock, "STATUS")
         assert "preload_managed: 0" in resp, "PRELOAD_MANAGED 0 failed"
-        print(send_cmd(sock, "PRELOAD_MANAGED 1"), end="")
-        resp = send_cmd(sock, "STATUS")
+        print(harness.send_socket_cmd(sock, "PRELOAD_MANAGED 1"), end="")
+        resp = harness.send_socket_cmd(sock, "STATUS")
         assert "preload_managed: 1" in resp, "PRELOAD_MANAGED 1 failed"
         print("PASS")
 
         # Shutdown
         print("\n── SHUTDOWN ──")
-        print(send_cmd(sock, "SHUTDOWN"), end="")
+        print(harness.send_socket_cmd(sock, "SHUTDOWN"), end="")
         proc.wait(timeout=5)
 
     except AssertionError as e:
