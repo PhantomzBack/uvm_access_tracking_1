@@ -39,7 +39,10 @@ __global__ void uvm_clear_l3s_kernel(void** l1_table)
 #include <cuda_runtime.h>
 
 // ── Globals ──────────────────────────────────────────────────────────────────
-int g_uvm_preload_managed = 1;
+int g_uvm_preload_managed = []() {
+    const char* v = getenv("UVM_PRELOAD_MANAGED");
+    return (v && v[0] == '0') ? 0 : 1;
+}();
 
 static std::thread              g_ctl_thread;
 static std::atomic<bool>        g_ctl_running{false};

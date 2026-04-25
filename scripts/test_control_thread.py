@@ -39,7 +39,7 @@ def compile_test():
     print("── Building long_running_test ──")
     cmd = [
         CLANG, "-x", "cuda", f"--cuda-gpu-arch=sm_{SM_ARCH}",
-        "-fgpu-rdc", "-O2", "-I./include",
+        "-fgpu-rdc", "-O2", "-I./include", "-rdynamic",
         "-DTRACKING_ENABLED", f"-fpass-plugin={PASS_PATH}",
         "examples/long_running_test.cu",
         "libMarkAccess.cu", "uvm_control_thread.cu",

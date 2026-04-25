@@ -95,7 +95,10 @@ static void ensure_init()
     g_init_done = true;
 
     // Spawn control thread if available (idempotent)
-    if (start_ctl_fn) start_ctl_fn();
+    // (can be disabled via UVM_NO_CONTROL_THREAD=1)
+    const char* no_ctl = getenv("UVM_NO_CONTROL_THREAD");
+    if (start_ctl_fn && (!no_ctl || no_ctl[0] != '1'))
+        start_ctl_fn();
 }
 
 // ── Helper: is the shadow L1 table already initialised? ──────────────────────
@@ -110,6 +113,13 @@ static bool should_preload_managed()
 {
     if (!g_preload_managed_ptr) return true;  // default: yes
     return *g_preload_managed_ptr != 0;
+}
+
+// ── Helper: should we preload a device (cudaMalloc) allocation? ──────────────
+static bool should_preload_device()
+{
+    const char* v = getenv("UVM_PRELOAD_DEVICE");
+    return !(v && v[0] == '0');  // default: yes
 }
 
 // ── Helper: process any pending allocations ──────────────────────────────────
@@ -127,6 +137,7 @@ static void process_pending()
 
     for (auto& a : to_process) {
         if (a.is_managed && !should_preload_managed()) continue;
+        if (!a.is_managed && !should_preload_device()) continue;
         g_in_preload = true;
         preload_range_fn((uintptr_t)a.ptr, a.size);
         g_in_preload = false;
@@ -143,6 +154,8 @@ static void register_alloc(void* ptr, size_t size, bool is_managed)
 
     // Skip managed pre-population if toggled off
     if (is_managed && !should_preload_managed()) return;
+    // Skip device pre-population if toggled off
+    if (!is_managed && !should_preload_device()) return;
 
     // If the page table is already up, pre-populate immediately.
     if (preload_range_fn && shadow_l1_ready()) {

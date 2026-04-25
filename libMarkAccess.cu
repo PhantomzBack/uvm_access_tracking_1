@@ -340,7 +340,10 @@ void init_tracking(void**** d_l1_ptr)
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Spawn background control thread for live enable/disable/snapshot
-    uvm_start_control_thread();
+    // (can be disabled via UVM_NO_CONTROL_THREAD=1)
+    const char* no_ctl = getenv("UVM_NO_CONTROL_THREAD");
+    if (!no_ctl || no_ctl[0] != '1')
+        uvm_start_control_thread();
 }
 
 // ── Host: pre-populate shadow page table for a given VA range ─────────────────
