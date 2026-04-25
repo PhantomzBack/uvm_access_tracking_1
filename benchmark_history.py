@@ -14,6 +14,10 @@ TARGET_FILES = [
     "UvmTrackingPass.cpp",
     "libMarkAccess.cu",
     "libMallocIntercept.cpp",
+    "common.h",
+    "include/tracking.h",
+    "uvm_control_thread.cu",
+    "uvm_control_thread.h",
 ]
 
 # Expanded paths to ensure dependency consistency
@@ -22,7 +26,9 @@ TARGET_PATHS = [
     "libMarkAccess.cu",
     "libMallocIntercept.cpp",
     "common.h",
-    "include",
+    "include/tracking.h",
+    "uvm_control_thread.cu",
+    "uvm_control_thread.h",
 ]
 
 RESULTS_DIR = Path("perf_results")
@@ -131,7 +137,7 @@ def run_benchmark(output_dir):
     log_file = output_dir / "benchmark.log"
 
     proc = subprocess.Popen(
-        ["python3", "benchmark.py", "--rebuild", "--mode", "preload-only"],
+        ["python3", "benchmark.py", "--preload", "--rebuild", "--mode", "preload-only"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True
