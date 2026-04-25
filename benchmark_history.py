@@ -131,7 +131,7 @@ def run_benchmark(output_dir):
     log_file = output_dir / "benchmark.log"
 
     proc = subprocess.Popen(
-        ["python3", "benchmark.py", "--rebuild"],
+        ["python3", "benchmark.py", "--rebuild", "--mode", "preload-only"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True

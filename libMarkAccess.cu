@@ -3,24 +3,6 @@
 #include "uvm_control_thread.h"
 #include <mutex>
 
-__device__ inline unsigned int my_match_any_sync(unsigned int mask, int value) {
-#if __CUDA_ARCH__ >= 700
-    return __match_any_sync(mask, value);
-#else
-    unsigned int matched = 0;
-    unsigned int remaining = mask;
-    while (remaining) {
-        int leader = __ffs(remaining) - 1;
-        int leader_val = __shfl_sync(mask, value, leader);
-        unsigned int current_match = __ballot_sync(mask, leader_val == value);
-        if (current_match & (1u << (threadIdx.x & 31))) matched = current_match;
-        remaining &= ~current_match;
-    }
-    return matched;
-#endif
-}
-
-
 // ── Host-accessible globals for LD_PRELOAD wrapper ────────────────────────────
 extern "C" void** g_uvm_shadow_l1 = nullptr;
 
@@ -214,7 +196,7 @@ extern "C" {
             }
 
             int lane = threadIdx.x & 31;
-            uint32_t group_mask = my_match_any_sync(full, key);
+            uint32_t group_mask = __match_any_sync(full, key);
             int leader = __ffs(group_mask) - 1;
             if (lane == leader) {
                 unsigned long long* word = &l3_bitmap[word_idx];

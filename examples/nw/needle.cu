@@ -223,7 +223,7 @@ int runTest(int argc, char** argv)
     CHECK_RETURN_VALUE(cudaDeviceSynchronize());
     t3 = gettime();
     printf("# kernel1 took %.6lf s\n", t3 - t2);
-
+    t2 = t3-t2;
     printf("Processing bottom-right matrix\n");
     //process bottom-right matrix
     for(int i = block_width - 1 ; i >= 1 ; i--){
@@ -243,7 +243,7 @@ int runTest(int argc, char** argv)
     CHECK_RETURN_VALUE(cudaDeviceSynchronize());
 
     t4 = gettime();
-    printf("# kernel2 took %.6lf s\n", t4 - t3);
+    printf("# GPU Runtime: %.6lf s\n", t4 - t3+t2);
 
 //#define TRACEBACK
 #ifdef TRACEBACK

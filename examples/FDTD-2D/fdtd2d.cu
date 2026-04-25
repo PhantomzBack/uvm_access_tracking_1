@@ -277,7 +277,7 @@ int main(int argc, char *argv[])
 	#endif
 	
 	//Warmup
-	fdtdCuda(_fict_gpu, ex_gpu, ey_gpu, hz_gpu, 0);
+	//fdtdCuda(_fict_gpu, ex_gpu, ey_gpu, hz_gpu, 0);
 
 	fdtdCuda(_fict_gpu, ex_gpu, ey_gpu, hz_gpu, 1);
 

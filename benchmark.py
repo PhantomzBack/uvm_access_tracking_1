@@ -16,7 +16,7 @@ CLANG        = "clang++-20"
 LOG_DIR      = "bench_logs"
 BASELINE_DIR = "baselines"
 PRELOAD_SO   = "./libMallocIntercept.so"
-SM_ARCH      = "61"
+SM_ARCH      = "89"
 # SM_ARCH    = subprocess.getoutput(
 #     "nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.'"
 # )
@@ -30,19 +30,42 @@ BASE_FLAGS = [
 # Each entry: (display_name, source_file, kernel_id, expected_pass_strategy)
 BENCHMARKS = [
     # Original suite
-    ("Coalesced",  "examples/benchmark_kernel.cu",  0, "BatchMarkAccess (runtime count)"),
-    ("Stride",     "examples/benchmark_kernel.cu",  1, "BatchMarkAccess (runtime count)"),
-    ("Random",     "examples/benchmark_kernel.cu",  2, "Fallback (non-affine index)"),
-    ("Stencil",    "examples/benchmark_kernel.cu",  3, "BatchMarkAccess x3 (runtime count)"),
-    ("Atomic",     "examples/benchmark_kernel.cu",  4, "Hoisted (loop-invariant ptr)"),
+    ("Coalesced",  "examples/benchmark_kernel.cu",  ["0"], "BatchMarkAccess (runtime count)"),
+    ("Stride",     "examples/benchmark_kernel.cu",  ["1"], "BatchMarkAccess (runtime count)"),
+    ("Random",     "examples/benchmark_kernel.cu",  ["2"], "Fallback (non-affine index)"),
+    ("Stencil",    "examples/benchmark_kernel.cu",  ["3"], "BatchMarkAccess x3 (runtime count)"),
+    ("Atomic",     "examples/benchmark_kernel.cu",  ["4"], "Hoisted (loop-invariant ptr)"),
     # Extended suite
-    ("SAXPY",      "examples/benchmark_extended.cu", 0,    "BatchMarkAccess x2 (runtime count)"),
-    ("Reduction",  "examples/benchmark_extended.cu", 1,    "BatchMarkAccess + Hoisted"),
-    ("Histogram",  "examples/benchmark_extended.cu", 2,    "BatchMarkAccess + Fallback (scatter)"),
-    ("Transpose",  "examples/benchmark_extended.cu", 3,    "Fallback (no loop / shared mem)"),
-    ("GEMV",       "examples/benchmark_extended.cu", 4,    "BatchMarkAccess (nested loops)"),
+    ("SAXPY",      "examples/benchmark_extended.cu", ["0"], "BatchMarkAccess x2 (runtime count)"),
+    ("Reduction",  "examples/benchmark_extended.cu", ["1"], "BatchMarkAccess + Hoisted"),
+    ("Histogram",  "examples/benchmark_extended.cu", ["2"], "BatchMarkAccess + Fallback (scatter)"),
+    ("Transpose",  "examples/benchmark_extended.cu", ["3"], "Fallback (no loop / shared mem)"),
+    ("GEMV",       "examples/benchmark_extended.cu", ["4"], "BatchMarkAccess (nested loops)"),
     # Real-world: tiled GEMM from CUDA Samples
-    ("MatrixMul",  "examples/matrixMul.cu",          None, "BatchMarkAccess (tiled A,B; SLE loop)"),
+    ("MatrixMul",  "examples/matrixMul.cu",          [], "BatchMarkAccess (tiled A,B; SLE loop)"),
+    # ("matrixMul", "examples/matrixMul.cu", "", "Testcase Description"),
+    # ("2DConvolution", "examples/2DCONV/2DConvolution.cu", ["-mb", "5000"], "Testcase Description"),
+    # ("2mm", "examples/2MM/2mm.cu", ["-mb", "200"], "Testcase Description"),
+    # ("3DConvolution", "examples/3DCONV/3DConvolution.cu", ["-mb", "6000"], "Testcase Description"),
+    # ("atax", "examples/ATAX/atax.cu", ["-mb", "6000"], "Testcase Description"),
+    # ("bicg", "examples/BICG/bicg.cu", ["-mb", "5000"], "Testcase Description"),
+    # ("covariance", "examples/COVAR/covariance.cu", [], "Testcase Description"),
+    # ("fdtd2d", "examples/FDTD-2D/fdtd2d.cu", ["-mb", "2000"], "Testcase Description"),
+    # ("gramschmidt", "examples/GRAMSCHM/gramschmidt.cu", [], "Testcase Description"),
+    # ("needle", "examples/nw/needle.cu", ["-mb", "5600"], "Testcase Description"),
+    # ("syr2k", "examples/SYR2K/syr2k.cu", [], "Testcase Description"),
+    # ("syrk", "examples/SYRK/syrk.cu", [], "Testcase Description"),
+    ("2DConvolution", "examples/2DCONV/2DConvolution.cu", [], "Testcase Description"),
+    ("2mm", "examples/2MM/2mm.cu", [], "Testcase Description"),
+    ("3DConvolution", "examples/3DCONV/3DConvolution.cu", [], "Testcase Description"),
+    ("atax", "examples/ATAX/atax.cu", [], "Testcase Description"),
+    ("bicg", "examples/BICG/bicg.cu", [], "Testcase Description"),
+    ("covariance", "examples/COVAR/covariance.cu", ["50000000"], "Testcase Description"),
+    ("fdtd2d", "examples/FDTD-2D/fdtd2d.cu", ["-mb", "2000"], "Testcase Description"),
+    ("gramschmidt", "examples/GRAMSCHM/gramschmidt.cu", [], "Testcase Description"),
+    ("needle", "examples/nw/needle.cu", ["-mb", "4000"], "Testcase Description"),
+    ("syr2k", "examples/SYR2K/syr2k.cu", [], "Testcase Description"),
+    ("syrk", "examples/SYRK/syrk.cu", [], "Testcase Description"),
 ]
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -244,9 +267,16 @@ def find_cu_files(root="examples"):
     cu_files = []
     skip_files = {
         "needle_kernel.cu",   # add more here if needed
-        "sgemm_cutlass.cu"
-        "test_kernel.cu"
-        "test_kernel_loop.cu"
+        "sgemm_cutlass.cu",
+        "test_kernel.cu",
+        "test_kernel_loop.cu",
+        "long_running_test.cu",
+        "malloc_intercept_example.cu",
+        "slow-cuda-kernel.cu",
+        "thread_mode_tests.cu",
+        "benchmark_kernel_stride.cu",
+        "thread_mode_tests.cu",
+        "malloc_intercept_example.cu"
         }
     for dirpath, _, filenames in os.walk(root):
         for f in filenames:
@@ -365,7 +395,7 @@ Examples:
         if src not in existing_sources:
             # Unique display name derived from path, so files in different folders do not collide.
             name = safe_slug(src)
-            auto_benchmarks.append((name, src, None, ""))
+            auto_benchmarks.append((name, src, [], ""))
 
     benchmarks = [
         (name, os.path.normpath(src), kid, strategy)
@@ -450,19 +480,24 @@ Examples:
         src = os.path.normpath(src)
         # print("Looking for:", src)
         # print("Available keys:", list(binaries.keys())[:5])
-
+        custom_input = {}
         normal_bin, instrumented_bin = binaries[src]
         log_path      = os.path.join(LOG_DIR, f"{safe_slug(src)}.log")
         pagelog_path  = os.path.join(LOG_DIR, f"{safe_slug(src)}.pagelog")
         baseline_path = os.path.join(BASELINE_DIR, f"{safe_slug(src)}.pagelog")
 
         print(f"  {name:<12}", end=" ", flush=True)
-        extra_args = ["-mb", "1000"]
-        cmd_n = [f"./{normal_bin}"] + ([str(kid)] if kid is not None else []) + extra_args
-        cmd_i = [f"./{instrumented_bin}"] + ([str(kid)] if kid is not None else []) + extra_args
-
-        cmd_n = [f"./{normal_bin}"]       + ([str(kid)] if kid is not None else [])
-        cmd_i = [f"./{instrumented_bin}"] + ([str(kid)] if kid is not None else [])
+        # extra_args = ["-mb", "1000"]
+        # cmd_n = [f"./{normal_bin}"] + ([str(kid)] if kid is not None else []) + extra_args
+        # cmd_i = [f"./{instrumented_bin}"] + ([str(kid)] if kid is not None else []) + extra_args
+        # flags = kid
+        # cmd_n = [f"./{normal_bin}"]       + ([str(kid)] if kid is not None else [])
+        # cmd_i = [f"./{instrumented_bin}"] + ([str(kid)] if kid is not None else [])
+        cmd_n = [f"./{normal_bin}"]       + kid # if kid is not None else []
+        cmd_i = [f"./{instrumented_bin}"] + kid # if kid is not None else []
+        
+        print(f"Running normal as: {cmd_n}")
+        print(f"Running instrumented as: {cmd_i}")
 
         # Run multiple iterations
         times_clean = []

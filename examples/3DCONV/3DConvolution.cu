@@ -228,22 +228,22 @@ int main(int argc, char *argv[])
 	#endif
 	convolution3DCuda(A_gpu, B_gpu, NI, NJ, NK);
 
-	if (!compare_with_cpu)
-		goto skip_comparison;
-	t_start = rtclock();
-	conv3D(A, B, NI, NJ, NK);
-	t_end = rtclock();
-	fprintf(stdout, "CPU Runtime: %0.6lfs\n", t_end - t_start);
+	//if (!compare_with_cpu)
+	//	goto skip_comparison;
+	// t_start = rtclock();
+	// conv3D(A, B, NI, NJ, NK);
+	// t_end = rtclock();
+	// fprintf(stdout, "CPU Runtime: %0.6lfs\n", t_end - t_start);
 	
-	compareResults(B, B_gpu, NI, NJ, NK);
+	// compareResults(B, B_gpu, NI, NJ, NK);
 
-skip_comparison:
-	if (copy_back_gpu_results && compare_with_cpu == 0) {
-		TOUCH_ARRAY(B_gpu, sizeof(DATA_TYPE)*NI*NJ*NK);
-	}
-	t_end = rtclock();
-	fprintf(stdout, "CPU + GPU: %lf s\n",
-	        t_end - t_after_array_init);
+//skip_comparison:
+	 //if (copy_back_gpu_results && compare_with_cpu == 0) {
+	 	//TOUCH_ARRAY(B_gpu, sizeof(DATA_TYPE)*NI*NJ*NK);
+	// }
+	// t_end = rtclock();
+	// fprintf(stdout, "CPU + GPU: %lf s\n",
+	//         t_end - t_after_array_init);
 
 	free(A);
 	free(B);
