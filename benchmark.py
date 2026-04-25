@@ -128,19 +128,19 @@ def allocation_fingerprint(pages):
     return len(pages), sorted(sizes)
 
 def compare_pagelogs(baseline_path, current_path):
-    """Compare two pagelogs by fingerprint. Returns (ok: bool, detail: str)."""
+    """Compare two pagelogs by fingerprint. Returns (ok: bool, detail: str, page_count: int)."""
     try:
         b_pages = parse_pagelog(baseline_path)
         c_pages = parse_pagelog(current_path)
     except Exception as e:
-        return False, f"parse error: {e}"
+        return False, f"parse error: {e}", 0
     b_total, b_sizes = allocation_fingerprint(b_pages)
     c_total, c_sizes = allocation_fingerprint(c_pages)
     if b_total != c_total:
-        return False, f"page count {b_total}→{c_total}"
+        return False, f"page count {b_total}→{c_total}", c_total
     if b_sizes != c_sizes:
-        return False, f"cluster layout differs ({len(b_sizes)} vs {len(c_sizes)} allocs)"
-    return True, f"{c_total} pages, {len(c_sizes)} alloc(s)"
+        return False, f"cluster layout differs ({len(b_sizes)} vs {len(c_sizes)} allocs)", c_total
+    return True, f"{c_total} pages, {len(c_sizes)} alloc(s)", c_total
 
 def parse_results_md(path):
     """Parse a results markdown file and return a dict of kernel -> {clean, tracked, overhead, baseline}."""
@@ -354,6 +354,9 @@ Examples:
             baseline_path = os.path.join(BASELINE_DIR, f"{name.lower()}.pagelog")
             print(f"  {name:<12}", end=" ", flush=True)
 
+            # Clean up stale access_log.bin before each baseline generation
+            if os.path.exists("access_log.bin"):
+                os.remove("access_log.bin")
             cmd_i = [f"./{instrumented_bin}"] + ([str(kid)] if kid is not None else [])
             out_i = run(cmd_i, env=preload_env)
 
@@ -394,7 +397,13 @@ Examples:
         # Run multiple iterations
         times_clean = []
         times_track = []
+        # Ensure no stale pagelog from a previous run/suite
+        if os.path.exists(pagelog_path):
+            os.remove(pagelog_path)
         for i in range(n_iterations):
+            # Clean up any leftover access_log.bin before each run
+            if os.path.exists("access_log.bin"):
+                os.remove("access_log.bin")
             out_n = run(cmd_n, env=preload_env)
             out_i = run(cmd_i, env=preload_env)
 
@@ -404,6 +413,11 @@ Examples:
                 times_clean.append(t_clean)
             if t_track is not None:
                 times_track.append(t_track)
+
+        # Brief cooldown between benchmarks to let GPU/driver settle
+        # (helps avoid intermittent CUDA context races)
+        import time
+        time.sleep(0.1)
 
         # Only keep the last pagelog (others are overwritten)
         if os.path.exists("access_log.bin"):
@@ -429,8 +443,9 @@ Examples:
             t_track = None
 
         # ── Baseline check ────────────────────────────────────────────────────
+        page_count = 0
         if os.path.exists(baseline_path) and os.path.exists(pagelog_path):
-            bl_ok, bl_detail = compare_pagelogs(baseline_path, pagelog_path)
+            bl_ok, bl_detail, page_count = compare_pagelogs(baseline_path, pagelog_path)
         elif not os.path.exists(baseline_path):
             bl_ok, bl_detail = None, "no baseline"
         else:
@@ -438,7 +453,7 @@ Examples:
 
         if t_clean is not None and t_track is not None:
             overhead = (t_track - t_clean) / t_clean * 100
-            results.append((name, strategy, t_clean, t_track, overhead, bl_ok, bl_detail))
+            results.append((name, strategy, t_clean, t_track, overhead, bl_ok, bl_detail, page_count))
             marker = "✓" if overhead < 50 else ("~" if overhead < 200 else "✗")
             bl_str = (f"  baseline={'PASS' if bl_ok else 'FAIL'}({bl_detail})"
                       if bl_ok is not None else f"  [{bl_detail}]")
@@ -446,22 +461,24 @@ Examples:
             print(f"{marker}  clean={t_clean:.3f}ms  tracked={t_track:.3f}ms"
                   f"  overhead={overhead:+.1f}%{iter_str}{bl_str}")
         else:
-            results.append((name, strategy, None, None, None, bl_ok, bl_detail))
+            results.append((name, strategy, None, None, None, bl_ok, bl_detail, 0))
             print("FAILED (check log)")
 
     # ── Results table ──────────────────────────────────────────────────────────
-    hdr = "| {:<14}| {:<40}| {:<12}| {:<12}| {:<10}| {:<22}|".format(
-        "Kernel", "Pass strategy", "Clean (ms)", "Tracked (ms)", "Overhead", "Baseline")
+    hdr = "| {:<14}| {:<40}| {:<12}| {:<12}| {:<10}| {:<8}| {:<22}|".format(
+        "Kernel", "Pass strategy", "Clean (ms)", "Tracked (ms)", "Overhead", "Pages", "Baseline")
     sep = ("| :---" + " " * 9 + "| :---" + " " * 35 + "| :---" + " " * 7
-           + "| :---" + " " * 7 + "| :---" + " " * 5 + "| :---" + " " * 17 + "|")
+           + "| :---" + " " * 7 + "| :---" + " " * 5 + "| :---" + " " * 3
+           + "| :---" + " " * 17 + "|")
     rows = []
-    for name, strategy, tc, tt, oh, bl_ok, bl_detail in results:
+    for name, strategy, tc, tt, oh, bl_ok, bl_detail, page_count in results:
         bl_cell = ("PASS" if bl_ok else ("FAIL: " + bl_detail if bl_ok is False else bl_detail))
+        pages_str = str(page_count) if page_count > 0 else "N/A"
         if tc is not None:
-            rows.append("| {:<14}| {:<40}| {:<12}| {:<12}| {:>+9.2f}% | {:<22}|".format(
-                name, strategy, f"{tc:.3f}", f"{tt:.3f}", oh, bl_cell))
+            rows.append("| {:<14}| {:<40}| {:<12}| {:<12}| {:>+9.2f}% | {:<8}| {:<22}|".format(
+                name, strategy, f"{tc:.3f}", f"{tt:.3f}", oh, pages_str, bl_cell))
         else:
-            rows.append(f"| {name:<14}| {strategy:<40}| FAILED     | FAILED     | N/A       | {bl_cell:<22}|")
+            rows.append(f"| {name:<14}| {strategy:<40}| FAILED     | FAILED     | N/A       | N/A     | {bl_cell:<22}|")
 
     table = "\n".join([hdr, sep] + rows)
     md = f"# Benchmark Results\n\nSM arch: sm_{SM_ARCH}\nMode: {mode_name}\n\n{table}\n"
@@ -470,15 +487,20 @@ Examples:
         f.write(md)
 
     # ── Baseline summary ───────────────────────────────────────────────────────
-    bl_results = [(name, ok, det) for name, _, _, _, _, ok, det in results]
+    bl_results = [(name, ok, det) for name, _, _, _, _, ok, det, _ in results]
     n_checked = sum(1 for _, ok, _ in bl_results if ok is not None)
     n_passed  = sum(1 for _, ok, _ in bl_results if ok is True)
     n_failed  = sum(1 for _, ok, _ in bl_results if ok is False)
+
+    # Total pages touched
+    total_pages = sum(pc for _, _, _, _, _, _, _, pc in results if pc > 0)
 
     print(f"\n── Summary ───────────────────────────────────────────────────────────")
     print(md)
     print(f"Full logs in '{LOG_DIR}/', page access logs in *.pagelog")
     print(f"Markdown results written to: {md_filename}")
+    if total_pages > 0:
+        print(f"Total pages touched: {total_pages}")
 
     # Optional: run pagelog correctness check using scripts/run_pgelog_test.py
     if check_pagelogs:

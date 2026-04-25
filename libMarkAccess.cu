@@ -306,8 +306,15 @@ void init_tracking(void**** d_l1_ptr)
 {
     CUDA_CHECK(cudaDeviceSetLimit(cudaLimitMallocHeapSize, 256ULL * 1024 * 1024 * 2));
 
-    // L1 table is just 512 pointers = 4KB
+#if UVM_TRACKING_MODE == 2
+    // In PRELOAD_ONLY mode L1 lives in managed memory so the CPU can walk it
+    // directly for snapshot/export and for host-side pre-population.
+    CUDA_CHECK(cudaMallocManaged(d_l1_ptr, L1_ENTRIES * sizeof(void**)));
+#else
+    // Modes 0/1 keep L1 in device memory because the GPU may allocate L2
+    // tables on-demand via device-side malloc().
     CUDA_CHECK(cudaMalloc(d_l1_ptr, L1_ENTRIES * sizeof(void**)));
+#endif
     CUDA_CHECK(cudaMemset(*d_l1_ptr, 0, L1_ENTRIES * sizeof(void**)));
 
     void*** temp = *d_l1_ptr;
@@ -352,7 +359,53 @@ extern "C" void uvm_tracking_preload_range(uintptr_t start, size_t size)
     uint32_t l1_start = (uint32_t)((start >> L1_SHIFT) & L1_MASK);
     uint32_t l1_end   = (uint32_t)((end   >> L1_SHIFT) & L1_MASK);
 
-    // Read L1 table to host
+#if UVM_TRACKING_MODE == 2
+    // In PRELOAD_ONLY mode L1 and L2 are managed memory.
+    // The CPU can read/write the page-table tree directly — no cudaMemcpy
+    // round-trips are needed for L1/L2.  L3 bitmaps remain device memory so
+    // that GPU atomicOr is as fast as possible.
+    void*** l1_table = (void***)g_uvm_shadow_l1;
+
+    for (uint32_t li = l1_start; li <= l1_end; ++li) {
+        if (!l1_table[li]) {
+            void** new_l2 = nullptr;
+            cudaError_t err = cudaMallocManaged(&new_l2, L2_ENTRIES * sizeof(void*));
+            if (err != cudaSuccess) {
+                fprintf(stderr,
+                        "[uvm_tracking_preload_range] cudaMallocManaged L2 failed: %s\n",
+                        cudaGetErrorString(err));
+                return;
+            }
+            cudaMemset(new_l2, 0, L2_ENTRIES * sizeof(void*));
+            l1_table[li] = new_l2;
+        }
+
+        uint32_t l2_start = (li == l1_start)
+                                ? (uint32_t)((start >> L2_SHIFT) & L2_MASK)
+                                : 0;
+        uint32_t l2_end   = (li == l1_end)
+                                ? (uint32_t)((end >> L2_SHIFT) & L2_MASK)
+                                : (L2_ENTRIES - 1);
+
+        void** l2_table = (void**)l1_table[li];
+        for (uint32_t lj = l2_start; lj <= l2_end; ++lj) {
+            if (!l2_table[lj]) {
+                void* new_l3 = nullptr;
+                cudaError_t err = cudaMalloc(&new_l3, L3_BYTES);
+                if (err != cudaSuccess) {
+                    fprintf(stderr,
+                            "[uvm_tracking_preload_range] cudaMalloc L3 failed: %s\n",
+                            cudaGetErrorString(err));
+                    return;
+                }
+                cudaMemset(new_l3, 0, L3_BYTES);
+                l2_table[lj] = new_l3;
+            }
+        }
+    }
+#else
+    // Modes 0/1: L1 and L2 are device memory, so we need cudaMemcpy to
+    // read/write the page-table tree from the host.
     void** h_l1[L1_ENTRIES];
     cudaError_t err = cudaMemcpy(h_l1, g_uvm_shadow_l1,
                                  L1_ENTRIES * sizeof(void**),
@@ -386,7 +439,6 @@ extern "C" void uvm_tracking_preload_range(uintptr_t start, size_t size)
                                 ? (uint32_t)((end >> L2_SHIFT) & L2_MASK)
                                 : (L2_ENTRIES - 1);
 
-        // Read L2 table
         void* h_l2[L2_ENTRIES];
         cudaMemcpy(h_l2, h_l1[li], L2_ENTRIES * sizeof(void*),
                    cudaMemcpyDeviceToHost);
@@ -408,6 +460,7 @@ extern "C" void uvm_tracking_preload_range(uintptr_t start, size_t size)
             }
         }
     }
+#endif
 }
 
 // ── Host: runtime toggles (used by control thread) ────────────────────────────
@@ -430,13 +483,20 @@ void export_log(void*** d_l1, const char* filename)
     LOG("[export_log] writing to %s\n", filename);
 
     std::vector<void**> h_l1(L1_ENTRIES);
+#if UVM_TRACKING_MODE == 2
+    // L1 is managed — directly readable on the CPU
+    memcpy(h_l1.data(), d_l1, L1_ENTRIES * sizeof(void**));
+#else
     CUDA_CHECK(cudaMemcpy(h_l1.data(), d_l1,
                           L1_ENTRIES * sizeof(void**), cudaMemcpyDeviceToHost));
+#endif
 
+#if UVM_TRACKING_MODE != 2
     void**              d_l2_stage;
     unsigned long long* d_l3_stage;
     CUDA_CHECK(cudaMalloc(&d_l2_stage, L2_ENTRIES * sizeof(void*)));
     CUDA_CHECK(cudaMalloc(&d_l3_stage, L3_BYTES));
+#endif
 
     std::vector<void*>              h_l2(L2_ENTRIES);
     std::vector<unsigned long long> bitmap(L3_BYTES / 8);
@@ -448,6 +508,39 @@ void export_log(void*** d_l1, const char* filename)
 
         LOG("[export_log] L1[%d] → %p\n", i, h_l1[i]);
 
+#if UVM_TRACKING_MODE == 2
+        // L2 is managed — dereference directly on the CPU.
+        // L3 remains device memory, so we still cudaMemcpy each bitmap.
+        void** l2_table = (void**)h_l1[i];
+        int accessed_l2 = 0;
+        for (int j = 0; j < L2_ENTRIES; j++) {
+            if (!l2_table[j]) continue;
+            accessed_l2++;
+
+            LOG("[export_log]   L2[%d] → %p\n", j, l2_table[j]);
+
+            cudaError_t err = cudaMemcpy(bitmap.data(), l2_table[j],
+                                         L3_BYTES, cudaMemcpyDeviceToHost);
+            if (err != cudaSuccess) continue;
+
+            int accessed_pages = 0;
+            for (int w = 0; w < (int)bitmap.size(); w++) {
+                if (!bitmap[w]) continue;
+                accessed_pages += __builtin_popcountll(bitmap[w]);
+                for (int b = 0; b < 64; b++) {
+                    if (bitmap[w] & (1ULL << b)) {
+                        uint64_t l3_offset = (uint64_t)w * 64 + b;
+                        uint64_t vaddr = ((uint64_t)i << L1_SHIFT)
+                                        | ((uint64_t)j << L2_SHIFT)
+                                        | (l3_offset   << L3_SHIFT);
+                        f << std::hex << "0x" << vaddr << "\n";
+                    }
+                }
+            }
+            LOG("[export_log]     L3 leaf had %d accessed pages\n", accessed_pages);
+        }
+        LOG("[export_log] L1 index %d had %d accessed L2 entries\n", i, accessed_l2);
+#else
         int blocks = (L2_ENTRIES + threads - 1) / threads;
         copy_l2_to_host<<<blocks, threads>>>(d_l1, i, d_l2_stage, L2_ENTRIES);
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -473,7 +566,6 @@ void export_log(void*** d_l1, const char* filename)
                 for (int b = 0; b < 64; b++) {
                     if (bitmap[w] & (1ULL << b)) {
                         uint64_t l3_offset = (uint64_t)w * 64 + b;
-                        // Reconstruct VA: l3_offset is the VPN within this leaf
                         uint64_t vaddr = ((uint64_t)i << L1_SHIFT)
                                         | ((uint64_t)j << L2_SHIFT)
                                         | (l3_offset   << L3_SHIFT);
@@ -484,42 +576,68 @@ void export_log(void*** d_l1, const char* filename)
             LOG("[export_log]     L3 leaf had %d accessed pages\n", accessed_pages);
         }
         LOG("[export_log] L1 index %d had %d accessed L2 entries\n", i, accessed_l2);
+#endif
     }
 
+#if UVM_TRACKING_MODE != 2
     cudaFree(d_l2_stage);
     cudaFree(d_l3_stage);
+#endif
 }
 
 void export_binary(void*** d_l1, const char* filename)
 {
     LOG("[export_binary] starting export\n");
-    // check_shadow_l1_kernel<<<1,1>>>();
     CUDA_CHECK(cudaDeviceSynchronize());
     LOG("[export_binary] writing to %s\n", filename);
 
-    // ── copy L1 to host ───────────────────────────────────────────────────────
     std::vector<void**> h_l1(L1_ENTRIES);
+#if UVM_TRACKING_MODE == 2
+    memcpy(h_l1.data(), d_l1, L1_ENTRIES * sizeof(void**));
+#else
     CUDA_CHECK(cudaMemcpy(h_l1.data(), d_l1,
                           L1_ENTRIES * sizeof(void**), cudaMemcpyDeviceToHost));
+#endif
 
-    // ── staging buffers ───────────────────────────────────────────────────────
+#if UVM_TRACKING_MODE != 2
     void**               d_l2_stage;
     unsigned long long*  d_l3_stage;
     CUDA_CHECK(cudaMalloc(&d_l2_stage, L2_ENTRIES * sizeof(void*)));
     CUDA_CHECK(cudaMalloc(&d_l3_stage, L3_BYTES));
+#endif
 
     std::vector<void*>              h_l2(L2_ENTRIES);
     std::vector<unsigned long long> bitmap(L3_BYTES / 8);
 
     int threads = 256;
 
-    // ── first pass: collect all populated leaves ──────────────────────────────
     struct Leaf { uint16_t l1, l2; std::vector<uint8_t> data; };
     std::vector<Leaf> leaves;
 
     for (int i = 0; i < L1_ENTRIES; i++) {
         if (!h_l1[i]) continue;
 
+#if UVM_TRACKING_MODE == 2
+        void** l2_table = (void**)h_l1[i];
+        for (int j = 0; j < L2_ENTRIES; j++) {
+            if (!l2_table[j]) continue;
+
+            cudaError_t err = cudaMemcpy(bitmap.data(), l2_table[j],
+                                         L3_BYTES, cudaMemcpyDeviceToHost);
+            if (err != cudaSuccess) continue;
+
+            bool any = false;
+            for (auto w : bitmap) if (w) { any = true; break; }
+            if (!any) continue;
+
+            Leaf leaf;
+            leaf.l1   = (uint16_t)i;
+            leaf.l2   = (uint16_t)j;
+            leaf.data.resize(L3_BYTES);
+            memcpy(leaf.data.data(), bitmap.data(), L3_BYTES);
+            leaves.push_back(std::move(leaf));
+        }
+#else
         int blocks = (L2_ENTRIES + threads - 1) / threads;
         copy_l2_to_host<<<blocks, threads>>>(d_l1, i, d_l2_stage, L2_ENTRIES);
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -536,7 +654,6 @@ void export_binary(void*** d_l1, const char* filename)
             CUDA_CHECK(cudaMemcpy(bitmap.data(), d_l3_stage,
                                   L3_BYTES, cudaMemcpyDeviceToHost));
 
-            // skip entirely-zero leaves
             bool any = false;
             for (auto w : bitmap) if (w) { any = true; break; }
             if (!any) continue;
@@ -548,10 +665,13 @@ void export_binary(void*** d_l1, const char* filename)
             memcpy(leaf.data.data(), bitmap.data(), L3_BYTES);
             leaves.push_back(std::move(leaf));
         }
+#endif
     }
 
+#if UVM_TRACKING_MODE != 2
     cudaFree(d_l2_stage);
     cudaFree(d_l3_stage);
+#endif
 
     LOG("[export_binary] %zu populated leaves\n", leaves.size());
 
