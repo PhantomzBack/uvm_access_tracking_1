@@ -10,6 +10,10 @@ void export_binary(void*** d_l1, const char* filename); // function to export th
 
 extern "C" void uvm_tracking_preload_range(uintptr_t start, size_t size);
 
+// Runtime toggles (used by control thread)
+extern "C" void uvm_tracking_set_enabled(int v);
+extern "C" void uvm_tracking_set_skip_on_miss(int v);
+
 //#ifdef __CUDACC__
 extern "C" __device__ void*** shadow_l1;
     // extern __device__ void*** shadow_l1; // device pointer to the L1 page table (array of pointers to L2 tables)

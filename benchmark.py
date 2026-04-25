@@ -5,6 +5,7 @@ import shutil
 import struct
 import sys
 import argparse
+import statistics
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PASS_PATH    = "./build/UvmTrackingPass.so"
@@ -47,7 +48,7 @@ def run(cmd, **kw):
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           text=True, **kw)
 
-def compile_pair(src, out_normal, out_instrumented, rdynamic=False):
+def compile_pair(src, out_normal, out_instrumented, rdynamic=False, mode=0):
     """Compile one source file into a normal and an instrumented binary."""
     common = BASE_FLAGS + [src]
     if rdynamic:
@@ -59,12 +60,15 @@ def compile_pair(src, out_normal, out_instrumented, rdynamic=False):
         print(r.stderr[-2000:])
         return False
 
-    r = run([CLANG] + common + [
+    inst_flags = common + [
         "-DTRACKING_ENABLED",
         f"-fpass-plugin={PASS_PATH}",
         LIB_PATH,
-        "-o", out_instrumented,
-    ])
+    ]
+    if mode != 0:
+        inst_flags = [f"-DUVM_TRACKING_MODE={mode}"] + inst_flags
+
+    r = run([CLANG] + inst_flags + ["-o", out_instrumented])
     if r.returncode != 0:
         print(f"\n  ✗ Instrumented compile failed for {src}")
         print(r.stderr[-2000:])
@@ -229,8 +233,11 @@ Examples:
   python3 benchmark.py --rebuild                 # Force rebuild binaries
   python3 benchmark.py --generate-baseline       # Generate baseline pagelogs
   python3 benchmark.py --preload                 # Use LD_PRELOAD for malloc intercept
+  python3 benchmark.py --mode preload-only       # Use PRELOAD_ONLY mode
   python3 benchmark.py --check                   # Run pagelog correctness checks
   python3 benchmark.py --diff a.md b.md          # Diff two result files
+  python3 benchmark.py -n 5                      # Run each benchmark 5 times
+  python3 benchmark.py -n 5 --metric median      # Use median of 5 runs
         """
     )
     parser.add_argument("output_file", nargs="?", default="results.md",
@@ -243,6 +250,13 @@ Examples:
                         help="Run pagelog correctness checks after benchmarks")
     parser.add_argument("--preload", action="store_true",
                         help="Use LD_PRELOAD for malloc intercept")
+    parser.add_argument("--mode", choices=["no-preload", "preload-alloc", "preload-only"],
+                        default="no-preload",
+                        help="Tracking mode (default: no-preload)")
+    parser.add_argument("--iterations", "-n", type=int, default=1,
+                        help="Number of iterations to run each benchmark (default: 1)")
+    parser.add_argument("--metric", choices=["mean", "median", "min"], default="mean",
+                        help="Metric to compute overhead from multiple runs (default: mean)")
     parser.add_argument("--diff", nargs=2, metavar=("FILE1", "FILE2"),
                         help="Diff two result markdown files")
 
@@ -257,7 +271,17 @@ Examples:
     gen_baseline      = args.generate_baseline
     check_pagelogs    = args.check
     use_preload       = args.preload
+    mode_name         = args.mode
     md_filename       = args.output_file
+    n_iterations      = args.iterations
+    metric_name       = args.metric
+
+    mode_map = {"no-preload": 0, "preload-alloc": 1, "preload-only": 2}
+    tracking_mode = mode_map[mode_name]
+
+    # Modes 1 and 2 require the preload wrapper
+    if tracking_mode in (1, 2):
+        use_preload = True
 
     os.makedirs(LOG_DIR,      exist_ok=True)
     os.makedirs("build",      exist_ok=True)
@@ -292,7 +316,11 @@ Examples:
     for src in sources:
         stem = os.path.splitext(os.path.basename(src))[0]
         normal_bin       = f"build/{stem}Normal"
-        instrumented_bin = f"build/{stem}Instrumented"
+        # Include mode in instrumented binary name so mode changes don't require --rebuild
+        if tracking_mode == 0:
+            instrumented_bin = f"build/{stem}Instrumented"
+        else:
+            instrumented_bin = f"build/{stem}Instrumented_mode{tracking_mode}"
         binaries[src]    = (normal_bin, instrumented_bin)
 
         src_mtime  = os.path.getmtime(src) if os.path.exists(src) else 0
@@ -309,7 +337,8 @@ Examples:
 
         if needs_build:
             print(f"  Building {stem}...", end=" ", flush=True)
-            ok = compile_pair(src, normal_bin, instrumented_bin, rdynamic=use_preload)
+            ok = compile_pair(src, normal_bin, instrumented_bin,
+                              rdynamic=use_preload, mode=tracking_mode)
             print("ok" if ok else "FAILED")
             if not ok:
                 print("Aborting.")
@@ -361,9 +390,22 @@ Examples:
 
         cmd_n = [f"./{normal_bin}"]       + ([str(kid)] if kid is not None else [])
         cmd_i = [f"./{instrumented_bin}"] + ([str(kid)] if kid is not None else [])
-        out_n = run(cmd_n, env=preload_env)
-        out_i = run(cmd_i, env=preload_env)
 
+        # Run multiple iterations
+        times_clean = []
+        times_track = []
+        for i in range(n_iterations):
+            out_n = run(cmd_n, env=preload_env)
+            out_i = run(cmd_i, env=preload_env)
+
+            t_clean = extract_time(out_n.stdout)
+            t_track = extract_time(out_i.stdout)
+            if t_clean is not None:
+                times_clean.append(t_clean)
+            if t_track is not None:
+                times_track.append(t_track)
+
+        # Only keep the last pagelog (others are overwritten)
         if os.path.exists("access_log.bin"):
             os.rename("access_log.bin", pagelog_path)
 
@@ -371,8 +413,20 @@ Examples:
             lf.write(f"=== CLEAN ===\n{out_n.stdout}\n{out_n.stderr}\n\n")
             lf.write(f"=== TRACKED ===\n{out_i.stdout}\n{out_i.stderr}\n\n")
 
-        t_clean = extract_time(out_n.stdout)
-        t_track = extract_time(out_i.stdout)
+        # Compute metric from multiple runs
+        if times_clean and times_track:
+            if metric_name == "mean":
+                t_clean = statistics.mean(times_clean)
+                t_track = statistics.mean(times_track)
+            elif metric_name == "median":
+                t_clean = statistics.median(times_clean)
+                t_track = statistics.median(times_track)
+            else:  # min
+                t_clean = min(times_clean)
+                t_track = min(times_track)
+        else:
+            t_clean = None
+            t_track = None
 
         # ── Baseline check ────────────────────────────────────────────────────
         if os.path.exists(baseline_path) and os.path.exists(pagelog_path):
@@ -388,8 +442,9 @@ Examples:
             marker = "✓" if overhead < 50 else ("~" if overhead < 200 else "✗")
             bl_str = (f"  baseline={'PASS' if bl_ok else 'FAIL'}({bl_detail})"
                       if bl_ok is not None else f"  [{bl_detail}]")
+            iter_str = f" (n={n_iterations}, {metric_name})" if n_iterations > 1 else ""
             print(f"{marker}  clean={t_clean:.3f}ms  tracked={t_track:.3f}ms"
-                  f"  overhead={overhead:+.1f}%{bl_str}")
+                  f"  overhead={overhead:+.1f}%{iter_str}{bl_str}")
         else:
             results.append((name, strategy, None, None, None, bl_ok, bl_detail))
             print("FAILED (check log)")
@@ -409,7 +464,7 @@ Examples:
             rows.append(f"| {name:<14}| {strategy:<40}| FAILED     | FAILED     | N/A       | {bl_cell:<22}|")
 
     table = "\n".join([hdr, sep] + rows)
-    md = f"# Benchmark Results\n\nSM arch: sm_{SM_ARCH}\n\n{table}\n"
+    md = f"# Benchmark Results\n\nSM arch: sm_{SM_ARCH}\nMode: {mode_name}\n\n{table}\n"
 
     with open(md_filename, "w") as f:
         f.write(md)

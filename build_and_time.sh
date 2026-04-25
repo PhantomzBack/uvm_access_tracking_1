@@ -1,7 +1,6 @@
 #!/bin/bash
 
 # Configuration
-GPU_ARCH="sm_80"
 CUDA_PATH="/usr/local/cuda"
 CLANG="clang++-20"
 PLUGIN="./build/UvmTrackingPass.so"
@@ -11,25 +10,64 @@ LIB_SRC="./libMarkAccess.cu"
 TARGET_FILE="../examples/benchmark_kernel_single.cu"
 OTHER_LIBRARIES="-lcudart -lcublas"
 
+# Detect GPU architecture dynamically
+GPU_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')
+GPU_ARCH="sm_${GPU_ARCH}"
+
 # Check if a filename was provided
 if [ "$#" -lt 1 ]; then
-    echo "Usage: $0 <source_file.cu> [--run] [--preload]"
+    echo "Usage: $0 <source_file.cu> [--run] [--preload] [--mode no-preload|preload-alloc|preload-only]"
     exit 1
 fi
 
 SOURCE_INPUT=$1
+shift  # remove source file from remaining args
+
 RUN_BENCHMARK=false
 USE_PRELOAD=false
+MODE="no-preload"
 
-# Parse flags
+# Parse remaining flags
 for arg in "$@"; do
     if [ "$arg" == "--run" ]; then
         RUN_BENCHMARK=true
-    fi
-    if [ "$arg" == "--preload" ]; then
+    elif [ "$arg" == "--preload" ]; then
         USE_PRELOAD=true
+    elif [ "$arg" == "--mode" ]; then
+        :  # value handled below
     fi
 done
+
+# Handle --mode <value>
+ARGS=("$@")
+for ((i=0; i<${#ARGS[@]}; i++)); do
+    if [ "${ARGS[$i]}" == "--mode" ]; then
+        j=$((i+1))
+        if [ $j -lt ${#ARGS[@]} ]; then
+            MODE="${ARGS[$j]}"
+        fi
+    fi
+done
+
+# Map mode to compile flag and preload requirement
+case "$MODE" in
+    no-preload)
+        MODE_FLAG=""
+        ;;
+    preload-alloc)
+        MODE_FLAG="-DUVM_TRACKING_MODE=1"
+        USE_PRELOAD=true
+        ;;
+    preload-only)
+        MODE_FLAG="-DUVM_TRACKING_MODE=2"
+        USE_PRELOAD=true
+        ;;
+    *)
+        echo "Unknown mode: $MODE"
+        echo "Valid modes: no-preload, preload-alloc, preload-only"
+        exit 1
+        ;;
+esac
 
 # Preload shared library
 PRELOAD_SO="./libMallocIntercept.so"
@@ -49,23 +87,24 @@ if [ "$USE_PRELOAD" = true ]; then
     ADDITIONAL_FLAGS="$ADDITIONAL_FLAGS -rdynamic"
 fi
 
-# 1. Copy the provided file to the target location
-# cp "$SOURCE_INPUT" "$TARGET_FILE"
-
 # Extract base name for executable naming
 FILENAME=$(basename -- "$SOURCE_INPUT")
 FILENAME_NO_EXT="${FILENAME%.*}"
 
 EXE_NORMAL="build/${FILENAME_NO_EXT}Normal"
 EXE_INSTRUMENTED="build/${FILENAME_NO_EXT}Instrumented"
+if [ "$MODE" != "no-preload" ]; then
+    EXE_INSTRUMENTED="build/${FILENAME_NO_EXT}Instrumented_${MODE}"
+fi
 
-echo "--- Compiling $FILENAME ---"
+echo "--- Compiling $FILENAME (mode: $MODE) ---"
 
 # 2. Compile Instrumented Version
 # Includes: -DTRACKING_ENABLED, the compiler pass, and the helper library
 $CLANG -x cuda --cuda-gpu-arch=$GPU_ARCH \
     $ADDITIONAL_FLAGS \
-    $INCLUDE_DIR\
+    $INCLUDE_DIR \
+    $MODE_FLAG \
     -DTRACKING_ENABLED \
     -fpass-plugin=$PLUGIN \
     "$SOURCE_INPUT" "$LIB_SRC" \

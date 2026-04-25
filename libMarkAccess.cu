@@ -2,6 +2,10 @@
 #include "tracking.h"
 #include <mutex>
 
+#ifndef UVM_TRACKING_MODE
+#define UVM_TRACKING_MODE 0
+#endif
+
 // ── Host-accessible globals for LD_PRELOAD wrapper ────────────────────────────
 extern "C" void** g_uvm_shadow_l1 = nullptr;
 
@@ -10,16 +14,83 @@ extern "C" {
     // shadow_l1 points to the L1 table (array of 512 void** pointers)
     __device__ void*** shadow_l1 = nullptr;
 
+    // Runtime-toggled constants (set from host via cudaMemcpyToSymbol)
+    __constant__ int g_tracking_enabled = 1;
+    __constant__ int g_skip_on_miss     = 0;
+
+    // ── Helper: mark a single page (used by BatchMarkAccess) ─────────────────
+    __device__ __forceinline__ void
+    mark_single_page(uintptr_t addr,
+                     uint32_t& cached_l1, uint32_t& cached_l2,
+                     void**& l2_table, unsigned long long*& l3_bitmap)
+    {
+        uint32_t _l1 = (uint32_t)(((addr) >> L1_SHIFT) & L1_MASK);
+        uint32_t _l2 = (uint32_t)(((addr) >> L2_SHIFT) & L2_MASK);
+        uint32_t _l3 = (uint32_t)(((addr) >> L3_SHIFT) & L3_MASK);
+
+        if (_l1 != cached_l1) {
+            if (!shadow_l1[_l1]) {
+#if UVM_TRACKING_MODE == 2
+                l2_table = nullptr; l3_bitmap = nullptr;
+                return;
+#elif UVM_TRACKING_MODE == 1
+                if (g_skip_on_miss) {
+                    l2_table = nullptr; l3_bitmap = nullptr;
+                    return;
+                }
+#endif
+                void** _nl2 = (void**)malloc(L2_ENTRIES * sizeof(void*));
+                if (!_nl2) { l2_table = nullptr; l3_bitmap = nullptr; return; }
+                unsigned long long _old = atomicCAS(
+                    (unsigned long long*)&shadow_l1[_l1],
+                    0ULL, (unsigned long long)_nl2);
+                if (_old != 0ULL) free(_nl2);
+                else              memset(_nl2, 0, L2_ENTRIES * sizeof(void*));
+            }
+            l2_table  = (void**)shadow_l1[_l1];
+            cached_l1 = _l1;  cached_l2 = (uint32_t)-1;  l3_bitmap = nullptr;
+        }
+        if (_l2 != cached_l2) {
+            if (!l2_table || !l2_table[_l2]) {
+#if UVM_TRACKING_MODE == 2
+                l3_bitmap = nullptr;
+                return;
+#elif UVM_TRACKING_MODE == 1
+                if (g_skip_on_miss) {
+                    l3_bitmap = nullptr;
+                    return;
+                }
+#endif
+                if (!l2_table) { l3_bitmap = nullptr; return; }
+                void* _nl3 = malloc(L3_BYTES);
+                if (!_nl3) { l3_bitmap = nullptr; return; }
+                unsigned long long _old = atomicCAS(
+                    (unsigned long long*)&l2_table[_l2],
+                    0ULL, (unsigned long long)_nl3);
+                if (_old != 0ULL) free(_nl3);
+                else              memset(_nl3, 0, L3_BYTES);
+            }
+            l3_bitmap = (unsigned long long*)l2_table[_l2];
+            cached_l2 = _l2;
+        }
+        if (l3_bitmap) {
+            unsigned long long* _w = &l3_bitmap[_l3 / 64];
+            unsigned long long  _m = 1ULL << (_l3 % 64);
+            if (!(*_w & _m)) atomicOr(_w, _m);
+        }
+    }
 
     // ── MarkAccess ────────────────────────────────────────────────────────────
     __device__ void MarkAccess(uintptr_t addr)
     {
-        LOG("[MarkAccess] called with addr=%p\n", (void*)addr);
+        if (!g_tracking_enabled) {
+            LOG("[MarkAccess] tracking disabled\n");
+            return;
+        }
         if (!shadow_l1) {
             LOG("[MarkAccess] shadow_l1 not initialised %p\n", shadow_l1);
             return;
         }
-        
 
         // Decompose address
         uint32_t l1_idx    = (addr >> L1_SHIFT) & L1_MASK;
@@ -36,6 +107,15 @@ extern "C" {
 
         // ── Level 1 → Level 2 (demand allocate L2 table) ─────────────────────
         if (shadow_l1[l1_idx] == nullptr) {
+#if UVM_TRACKING_MODE == 2
+            LOG("[MarkAccess] mode 2: L2 missing, skipping\n");
+            return;
+#elif UVM_TRACKING_MODE == 1
+            if (g_skip_on_miss) {
+                LOG("[MarkAccess] skip_on_miss: L2 missing, skipping\n");
+                return;
+            }
+#endif
             void** new_l2 = (void**)malloc(L2_ENTRIES * sizeof(void*));
             LOG("[MarkAccess] malloc for L2 table returned %p\n", new_l2);
             if (!new_l2) return;
@@ -68,6 +148,15 @@ extern "C" {
 
         // ── Level 2 → Level 3 (demand allocate L3 bitmap leaf) ───────────────
         if (l2_table[l2_idx] == nullptr) {
+#if UVM_TRACKING_MODE == 2
+            LOG("[MarkAccess] mode 2: L3 missing, skipping\n");
+            return;
+#elif UVM_TRACKING_MODE == 1
+            if (g_skip_on_miss) {
+                LOG("[MarkAccess] skip_on_miss: L3 missing, skipping\n");
+                return;
+            }
+#endif
             void* new_l3 = malloc(L3_BYTES);
             if (!new_l3) return;
 
@@ -142,48 +231,7 @@ extern "C" {
     //     the leader handle the marking for the whole warp.
     __device__ void BatchMarkAccess(uintptr_t base_addr, int64_t stride, uint64_t count)
     {
-        if (!shadow_l1 || count == 0) return;
-
-        // Helper: traverse L1→L2→L3 and mark one page.
-        // Declared as a lambda-style macro to avoid a device function call.
-        // 'cached_l1', 'cached_l2', 'l2_table', 'l3_bitmap' are in the caller's scope.
-#define MARK_PAGE(addr)                                                          \
-        do {                                                                     \
-            uint32_t _l1 = (uint32_t)(((addr) >> L1_SHIFT) & L1_MASK);          \
-            uint32_t _l2 = (uint32_t)(((addr) >> L2_SHIFT) & L2_MASK);          \
-            uint32_t _l3 = (uint32_t)(((addr) >> L3_SHIFT) & L3_MASK);          \
-            if (_l1 != cached_l1) {                                              \
-                if (!shadow_l1[_l1]) {                                           \
-                    void** _nl2 = (void**)malloc(L2_ENTRIES * sizeof(void*));    \
-                    if (!_nl2) break;                                             \
-                    unsigned long long _old = atomicCAS(                         \
-                        (unsigned long long*)&shadow_l1[_l1],                   \
-                        0ULL, (unsigned long long)_nl2);                         \
-                    if (_old != 0ULL) free(_nl2);                                \
-                    else              memset(_nl2, 0, L2_ENTRIES * sizeof(void*)); \
-                }                                                                \
-                l2_table  = (void**)shadow_l1[_l1];                             \
-                cached_l1 = _l1;  cached_l2 = (uint32_t)-1;  l3_bitmap = nullptr; \
-            }                                                                    \
-            if (_l2 != cached_l2) {                                              \
-                if (!l2_table[_l2]) {                                            \
-                    void* _nl3 = malloc(L3_BYTES);                               \
-                    if (!_nl3) break;                                             \
-                    unsigned long long _old = atomicCAS(                         \
-                        (unsigned long long*)&l2_table[_l2],                    \
-                        0ULL, (unsigned long long)_nl3);                         \
-                    if (_old != 0ULL) free(_nl3);                                \
-                    else              memset(_nl3, 0, L3_BYTES);                 \
-                }                                                                \
-                l3_bitmap = (unsigned long long*)l2_table[_l2];                 \
-                cached_l2 = _l2;                                                 \
-            }                                                                    \
-            if (l3_bitmap) {                                                     \
-                unsigned long long* _w = &l3_bitmap[_l3 / 64];                  \
-                unsigned long long  _m = 1ULL << (_l3 % 64);                    \
-                    if (!(*_w & _m)) atomicOr(_w, _m);                              \
-            }                                                                    \
-        } while (0)
+        if (!g_tracking_enabled || !shadow_l1 || count == 0) return;
 
         uint32_t            cached_l1 = (uint32_t)-1;
         uint32_t            cached_l2 = (uint32_t)-1;
@@ -213,7 +261,7 @@ extern "C" {
                 return;
 
             for (uintptr_t p = start_page; p <= end_page; p++)
-                MARK_PAGE(p << 12);
+                mark_single_page(p << 12, cached_l1, cached_l2, l2_table, l3_bitmap);
 
             return;
         }
@@ -227,10 +275,8 @@ extern "C" {
             uintptr_t cur_page = addr >> 12;
             if (cur_page == last_page) continue;
             last_page = cur_page;
-            MARK_PAGE(addr);
+            mark_single_page(addr, cached_l1, cached_l2, l2_table, l3_bitmap);
         }
-
-#undef MARK_PAGE
     }
 
     __global__ void copy_l2_to_host(void*** l1, int l1_idx, void** out, int n)
@@ -266,7 +312,15 @@ void init_tracking(void**** d_l1_ptr)
 
     void*** temp = *d_l1_ptr;
     CUDA_CHECK(cudaMemcpyToSymbol(shadow_l1, &temp, sizeof(void***)));
-    LOG("[init_tracking] shadow_l1 set to %p\n", temp);
+
+    // Set runtime toggle defaults based on compile-time mode
+    int enabled = 1;
+    int skip    = (UVM_TRACKING_MODE == 2) ? 1 : 0;
+    CUDA_CHECK(cudaMemcpyToSymbol(g_tracking_enabled, &enabled, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(g_skip_on_miss,     &skip,    sizeof(int)));
+
+    LOG("[init_tracking] shadow_l1 set to %p, mode=%d, enabled=%d, skip=%d\n",
+        temp, (int)UVM_TRACKING_MODE, enabled, skip);
     void*** readback = nullptr;
     CUDA_CHECK(cudaMemcpyFromSymbol(&readback, shadow_l1, sizeof(void***)));
     LOG("[init_tracking] shadow_l1 → %p (readback %p)\n", temp, readback);
@@ -356,6 +410,19 @@ extern "C" void uvm_tracking_preload_range(uintptr_t start, size_t size)
     }
 }
 
+// ── Host: runtime toggles (used by control thread) ────────────────────────────
+extern "C" void uvm_tracking_set_enabled(int v)
+{
+    int val = v ? 1 : 0;
+    CUDA_CHECK(cudaMemcpyToSymbol(g_tracking_enabled, &val, sizeof(int)));
+}
+
+extern "C" void uvm_tracking_set_skip_on_miss(int v)
+{
+    int val = v ? 1 : 0;
+    CUDA_CHECK(cudaMemcpyToSymbol(g_skip_on_miss, &val, sizeof(int)));
+}
+
 // ── Host: walk the page table and dump accessed addresses ────────────────────
 void export_log(void*** d_l1, const char* filename)
 {
@@ -390,7 +457,7 @@ void export_log(void*** d_l1, const char* filename)
         for (int j = 0; j < L2_ENTRIES; j++) {
             if (!h_l2[j]) continue;
                 accessed_l2++;
-            
+
             LOG("[export_log]   L2[%d] → %p\n", j, h_l2[j]);
 
             int l3_words = L3_BYTES / 8;
