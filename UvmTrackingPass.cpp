@@ -11,6 +11,12 @@
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #include <set>
 
+#ifdef UVM_DEBUG
+#define UVM_DBGS() llvm::errs()
+#else
+#define UVM_DBGS() llvm::nulls()
+#endif
+
 static constexpr uint64_t PAGE_SHIFT = 12;
 static constexpr uint64_t PAGE_SIZE  = (1ULL << PAGE_SHIFT); // 4096
 
@@ -67,7 +73,7 @@ PageInvarianceResult checkPageInvariance(
 
     // ── Case 1: Fully loop-invariant address → trivially page-invariant ──
     if (SE.isLoopInvariant(PtrSCEV, L)){
-        llvm::errs() << "[UvmPass] Loop-invariant pointer detected at" << *PtrSCEV
+        UVM_DBGS() << "[UvmPass] Loop-invariant pointer detected at" << *PtrSCEV
                    << "\n";
         return {PageInvariance::Invariant};
     }
@@ -84,18 +90,18 @@ PageInvarianceResult checkPageInvariance(
 
     // Get trip count (number of iterations, not backedge count)
     uint64_t TC = SE.getSmallConstantTripCount(L);
-    
-    llvm::errs() << "[UvmPass] Analyzing affine recurrence: " << *AR << "\n";
+
+    UVM_DBGS() << "[UvmPass] Analyzing affine recurrence: " << *AR << "\n";
 
     // ── Case 2a: Stride is 0 → pointer never moves ──
     if (StrideSCEV->isZero()){
-        llvm::errs() << "[UvmPass] Zero stride detected: " << *StrideSCEV << "\n";
+        UVM_DBGS() << "[UvmPass] Zero stride detected: " << *StrideSCEV << "\n";
         return { PageInvariance::Invariant, StrideSCEV, TC, 0 };
     }
 
     // ── Case 2b: Constant stride and known trip count ──
     if (auto *ConstStride = llvm::dyn_cast<llvm::SCEVConstant>(StrideSCEV)) {
-        llvm::errs() << "[UvmPass] Constant stride detected: " << *ConstStride << "\n";
+        UVM_DBGS() << "[UvmPass] Constant stride detected: " << *ConstStride << "\n";
         int64_t S = ConstStride->getAPInt().getSExtValue();
         uint64_t absStride = std::abs(S);
 
@@ -136,7 +142,7 @@ PageInvarianceResult checkPageInvariance(
     // Stride is loop-invariant (guaranteed by isAffine() above).  Return Variant
     // so emitBatchMarkAccess can expand both stride and TC via SCEVExpander.
     // If SCEVExpander can't resolve them at compile time it will bail out safely.
-    llvm::errs() << "[UvmPass] Non-constant affine stride, returning Variant: " << *PtrSCEV << "\n";
+    UVM_DBGS() << "[UvmPass] Non-constant affine stride, returning Variant: " << *PtrSCEV << "\n";
     return { PageInvariance::Variant, StrideSCEV, TC, 0 };
 }
 
@@ -315,7 +321,7 @@ static bool emitBatchMarkAccess(
             // emit ceildiv(bound - start, step) as IR at the preheader.
             llvm::BasicBlock *ExitingBB = L->getExitingBlock();
             if (!ExitingBB) {
-                llvm::errs() << "[UVM] BatchMarkAccess: no single exiting block\n";
+                UVM_DBGS() << "[UVM] BatchMarkAccess: no single exiting block\n";
                 return false;
             }
             auto *BI = llvm::dyn_cast<llvm::BranchInst>(ExitingBB->getTerminator());
@@ -372,7 +378,7 @@ static bool emitBatchMarkAccess(
     if (auto *ConstCount = llvm::dyn_cast<llvm::SCEVConstant>(CountSCEV)) {
         uint64_t countVal = ConstCount->getAPInt().getZExtValue();
         if (countVal > 1000) {
-            llvm::errs() << "[UVM] BatchMarkAccess: count " << countVal << " too large, skipping\n";
+            UVM_DBGS() << "[UVM] BatchMarkAccess: count " << countVal << " too large, skipping\n";
             return false;
         }
     }
@@ -392,9 +398,9 @@ static bool emitBatchMarkAccess(
     if (!HoistPreheader) return false;
 
     if (HoistTarget != L)
-        llvm::errs() << "[UVM] BatchMarkAccess hoisted depth "
-                     << L->getLoopDepth() << " → "
-                     << HoistTarget->getLoopDepth() << "\n";
+        UVM_DBGS() << "[UVM] BatchMarkAccess hoisted depth "
+                   << L->getLoopDepth() << " → "
+                   << HoistTarget->getLoopDepth() << "\n";
 
     // ── Expand SCEVs and emit runtime count (if needed) ───────────────────────
     llvm::SCEVExpander Expander(SE, DL, "batch.mark");
@@ -426,7 +432,7 @@ static bool emitBatchMarkAccess(
         llvm::Value *Active = RB.CreateICmpULT(StartV, BoundV, "rt.active");
         CountVal = RB.CreateSelect(Active, TripCount,
                                    llvm::ConstantInt::get(I64Ty, 0), "rt.count");
-        llvm::errs() << "[UVM] BatchMarkAccess: emitting runtime count for " << *PtrSCEV << "\n";
+        UVM_DBGS() << "[UVM] BatchMarkAccess: emitting runtime count for " << *PtrSCEV << "\n";
     } else {
         CountVal = Expander.expandCodeFor(CountSCEV, I64Ty, InsertIt);
     }
@@ -477,22 +483,22 @@ llvm::Value *emitPageInvarianceRuntimeCheck(
         switch (Result.kind) {
         case PageInvariance::Invariant:
             // Safe to hoist mark_page() to preheader unconditionally
-            llvm::errs() << "[UVM] Page-invariant (address invariant): " << *Ptr << "\n";
+            UVM_DBGS() << "[UVM] Page-invariant (address invariant): " << *Ptr << "\n";
             hoistMarkPage(Ptr, L, MarkFuncPtr);
             break;
 
         case PageInvariance::MaybeInvariant:
             // Hoist behind runtime check
-            llvm::errs() << "[UVM] Maybe page-invariant: range=" 
-                        << Result.byteRange << " bytes\n";
+            UVM_DBGS() << "[UVM] Maybe page-invariant: range="
+                       << Result.byteRange << " bytes\n";
             hoistMarkPageConditional(Ptr, L, Result.byteRange, MarkFuncPtr);
             break;
 
         case PageInvariance::Variant:
             // Keep instrumentation in-loop; optionally prefetch or
             // analyze the stride pattern for your 2-level table traversal
-            llvm::errs() << "[UVM] Page-variant: stride=" 
-                        << *Result.stride << " TC=" << Result.tripCount << "\n";
+            UVM_DBGS() << "[UVM] Page-variant: stride="
+                       << *Result.stride << " TC=" << Result.tripCount << "\n";
             // Bonus: if stride == PAGE_SIZE, you can compute accessed pages
             // statically and batch-mark them in the preheader
             if (isPageAlignedStride(Result.stride))
@@ -504,7 +510,7 @@ llvm::Value *emitPageInvarianceRuntimeCheck(
             break;
         }
     }
-                              
+
 using namespace llvm;
 
 class UvmTrackingPass : public PassInfoMixin<UvmTrackingPass> {
@@ -516,8 +522,7 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
     if (M.getSourceFileName().find("libMarkAccess") != std::string::npos)
         return PreservedAnalyses::all();
 
-    fprintf(stderr, "[UvmPass] Running on module: %s\n",
-            M.getSourceFileName().c_str());
+    UVM_DBGS() << "[UvmPass] Running on module: " << M.getSourceFileName() << "\n";
 
     auto &Ctx = M.getContext();
     FunctionCallee MarkFunc = M.getOrInsertFunction(
@@ -535,8 +540,7 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
         if (!F.getFnAttribute("target-features").getValueAsString().contains("ptx")) continue;
         if (F.isDeclaration() || F.getName().contains("MarkAccess")) continue;
 
-        fprintf(stderr, "[UvmPass] Processing function: %s\n",
-                F.getName().str().c_str());
+        UVM_DBGS() << "[UvmPass] Processing function: " << F.getName() << "\n";
 
         // ── Now you can use function-level analyses ──
         auto &LI = FAM.getResult<LoopAnalysis>(F);
@@ -567,9 +571,9 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
                                   F.getEntryBlock().getFirstInsertionPt());
 
         // ── PHASE TWO: Instrument ──
-        errs() << "[UvmPass] Found " << Targets.size() << " targets in "
-               << F.getName() << "\n";
-               
+        UVM_DBGS() << "[UvmPass] Found " << Targets.size() << " targets in "
+                   << F.getName() << "\n";
+
         std::set<const SCEV*> InstrumentedInBlock;
         BasicBlock *CurrentBlock = nullptr;
 
@@ -587,55 +591,55 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
 
             const SCEV *PtrSCEV = SE.getSCEV(Ptr);
             if (!InstrumentedInBlock.insert(PtrSCEV).second) {
-                errs() << "   [-] Skipping already instrumented pointer (SCEV) in block: " << *PtrSCEV << "\n";
+                UVM_DBGS() << "   [-] Skipping already instrumented pointer (SCEV) in block: " << *PtrSCEV << "\n";
                 continue;
             }
 
             if (const DebugLoc &DL = Inst->getDebugLoc()) {
-                errs() << "[UvmPass] Instrumenting " 
-                       << DL->getFilename() << ":" << DL.getLine()
-                       << " (" << Inst->getOpcodeName() << ")\n";
-            } 
+                UVM_DBGS() << "[UvmPass] Instrumenting "
+                           << DL->getFilename() << ":" << DL.getLine()
+                           << " (" << Inst->getOpcodeName() << ")\n";
+            }
 
             // Find which loop this instruction is in (if any)
             Loop *L = LI.getLoopFor(Inst->getParent()); // ← new
             if (L) {
-                errs() << "   [-] Analyzing loop at depth " << L->getLoopDepth()
-                       << " for instruction: " << *Inst << "\n";
+                UVM_DBGS() << "   [-] Analyzing loop at depth " << L->getLoopDepth()
+                           << " for instruction: " << *Inst << "\n";
                 // Try page invariance — hoist if possible
                 auto Result = checkPageInvariance(Ptr, L, SE);
-                
+
 
 
                 if (Result.kind == PageInvariance::Invariant) {
                     auto SCEVStride = Result.stride ? Result.stride : nullptr;
                     if(Result.stride) {
-                        errs() << "   [-] SCEV Stride: " << SCEVStride << "\n";
+                        UVM_DBGS() << "   [-] SCEV Stride: " << SCEVStride << "\n";
                     }
-                    errs() << "[UVM] Page-invariant: " << *Ptr << "\n";
+                    UVM_DBGS() << "[UVM] Page-invariant: " << *Ptr << "\n";
 
                     hoistMarkPage(Ptr, L, cast<Function>(MarkFunc.getCallee()));
                     continue; // skip per-instruction instrumentation below
                 }
                 if (Result.kind == PageInvariance::MaybeInvariant) {
-                    errs() << "[UVM] Maybe page-invariant: range=" 
-                           << Result.byteRange << " bytes\n";
+                    UVM_DBGS() << "[UVM] Maybe page-invariant: range="
+                               << Result.byteRange << " bytes\n";
                     hoistMarkPageConditional(Ptr, L, Result.byteRange,
                                             cast<Function>(MarkFunc.getCallee()));
                     continue;
                 }
                 if (Result.kind == PageInvariance::Variant && Result.stride) {
-                    errs() << "[UVM] BatchMarkAccess: stride=" << *Result.stride
-                           << " TC=" << Result.tripCount << "\n";
+                    UVM_DBGS() << "[UVM] BatchMarkAccess: stride=" << *Result.stride
+                               << " TC=" << Result.tripCount << "\n";
                     if (emitBatchMarkAccess(Ptr, L, Result, SE, BatchMarkFn,
                                            M.getDataLayout()))
                         continue;
                     else
-                        errs() << "[UVM] BatchMarkAccess failed to emit for " << *Ptr << "\n";
+                        UVM_DBGS() << "[UVM] BatchMarkAccess failed to emit for " << *Ptr << "\n";
                     // batch failed — fall through to per-instruction fallback
                 }
                 // Unknown → per-instruction fallback
-            } 
+            }
 
 
                     // fallback: per-instruction instrumentation
@@ -656,10 +660,10 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
             Builder.CreateStore(CurPage, LocalCacheVar);
 
             Changed = true;
-            errs() << "   [+] Instrumented: " << *Inst << "\n";
+            UVM_DBGS() << "   [+] Instrumented: " << *Inst << "\n";
         }
     }
-    errs() << "[UvmPass] Finished processing module: " << M.getSourceFileName() << "\n";
+    UVM_DBGS() << "[UvmPass] Finished processing module: " << M.getSourceFileName() << "\n";
     return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 };

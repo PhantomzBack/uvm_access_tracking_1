@@ -92,7 +92,7 @@ def l3_bitmap(hdr, leaves, l1_idx, l2_idx):
     """Returns bit array[L3_BITS] for a given (L1, L2) leaf, or zeros."""
     bitmap = leaves.get((l1_idx, l2_idx),
                         np.zeros(hdr["l3_bytes"], dtype=np.uint8))
-    return np.unpackbits(bitmap).astype(np.float32)
+    return np.unpackbits(bitmap, bitorder="little").astype(np.float32)
 
 
 # ── VA label helpers ──────────────────────────────────────────────────────────

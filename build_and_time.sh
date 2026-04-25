@@ -92,10 +92,10 @@ fi
 FILENAME=$(basename -- "$SOURCE_INPUT")
 FILENAME_NO_EXT="${FILENAME%.*}"
 
-EXE_NORMAL="build/${FILENAME_NO_EXT}Normal"
-EXE_INSTRUMENTED="build/${FILENAME_NO_EXT}Instrumented"
+EXE_NORMAL="build/${FILENAME_NO_EXT}_normal"
+EXE_INSTRUMENTED="build/${FILENAME_NO_EXT}_instrumented"
 if [ "$MODE" != "no-preload" ]; then
-    EXE_INSTRUMENTED="build/${FILENAME_NO_EXT}Instrumented_${MODE}"
+    EXE_INSTRUMENTED="build/${FILENAME_NO_EXT}_instrumented_${MODE}"
 fi
 
 echo "--- Compiling $FILENAME (mode: $MODE) ---"

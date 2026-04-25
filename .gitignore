@@ -13,3 +13,9 @@
 *tags*
 build/**
 !build/Makefile_Main
+\.*
+*log
+cuda-oversubscribed-benchmarks-main/**
+pagelog_test_results/**
+results/**
+__pycache__/
