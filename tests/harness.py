@@ -51,9 +51,14 @@ PRELOAD_SO = os.path.join(ROOT, "libMallocIntercept.so")
 CUDA_PATH  = "/usr/local/cuda"
 CLANG      = "clang++-20"
 
-SM_ARCH = subprocess.getoutput(
-    "nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.'"
-).strip()
+try:
+    SM_ARCH = subprocess.getoutput(
+        "nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.'"
+    ).strip()
+    if not SM_ARCH or not SM_ARCH.isdigit():
+        SM_ARCH = "61"
+except Exception:
+    SM_ARCH = "61"
 
 BASE_FLAGS = [
     "-x", "cuda", f"--cuda-gpu-arch=sm_{SM_ARCH}",

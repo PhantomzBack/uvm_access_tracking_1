@@ -16,13 +16,17 @@ CLANG        = "clang++-20"
 LOG_DIR      = "bench_logs"
 BASELINE_DIR = "baselines"
 PRELOAD_SO   = "./libMallocIntercept.so"
-SM_ARCH      = "89"
-# SM_ARCH    = subprocess.getoutput(
-#     "nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.'"
-# )
+try:
+    SM_ARCH = subprocess.getoutput(
+        "nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.'"
+    ).strip()
+    if not SM_ARCH or not SM_ARCH.isdigit():
+        SM_ARCH = "61"
+except Exception:
+    SM_ARCH = "61"
 BASE_FLAGS = [
     "-x", "cuda", f"--cuda-gpu-arch=sm_{SM_ARCH}",
-    "-fgpu-rdc", "-O2", "-I./include",
+    "-fgpu-rdc", "-O2", "-I./",
     f"--cuda-path={CUDA_PATH}", f"-L{CUDA_PATH}/lib64", "-lcudart",
 ]
 

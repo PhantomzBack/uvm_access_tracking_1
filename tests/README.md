@@ -6,6 +6,16 @@ This document explains the testing framework used in this repository and how to 
 
 The testing framework is driven by the `run_tests.py` script located in the root of the repository. It is a lightweight, directory-based test runner that automatically discovers and executes tests.
 
+### Current Test Suites
+
+The `tests/` directory contains several specific test suites targeting different parts of the UVM tracking system:
+
+- **`control_thread/`**: Verifies the UNIX domain socket control interface and the long-running application flow, ensuring that tracking statistics can be queried or flushed dynamically without stopping the application.
+- **`integration/`**: End-to-end tests applying the compiler pass and runtime library to real-world or larger sample programs. Validates functional correctness and ensures tracking does not corrupt application logic.
+- **`microbenchmarks/`**: Small, targeted kernels testing specific access patterns (e.g., contiguous, strided, atomic). Ensures the pass logic (like loop hoisting and batching) works correctly and generates accurate page counts with low overhead.
+- **`pagelog_parser/`**: Validates the utilities that parse the binary `access_log.bin` format into memory addresses and checks that logs are being constructed correctly.
+- **`thread_modes/`**: Tests the tracking initialization logic under different modes (e.g., standard, LD_PRELOAD wrapper, or manual READY/GO handshakes) to ensure robust lifecycle management.
+
 ### Test Discovery
 
 The `run_tests.py` script looks for tests in the `tests/` directory. Specifically, it considers any subdirectory inside `tests/` to be a test suite if it contains a `test.py` file. 
