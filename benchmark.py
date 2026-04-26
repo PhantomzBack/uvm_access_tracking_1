@@ -26,7 +26,7 @@ except Exception:
     SM_ARCH = "61"
 BASE_FLAGS = [
     "-x", "cuda", f"--cuda-gpu-arch=sm_{SM_ARCH}",
-    "-fgpu-rdc", "-O2", "-I./",
+    "-fgpu-rdc", "-O2", "-I./", "-I./include/",
     f"--cuda-path={CUDA_PATH}", f"-L{CUDA_PATH}/lib64", "-lcudart",
 ]
 
@@ -65,9 +65,9 @@ BENCHMARKS = [
     ("atax", "examples/ATAX/atax.cu", [], "Testcase Description"),
     ("bicg", "examples/BICG/bicg.cu", [], "Testcase Description"),
     ("covariance", "examples/COVAR/covariance.cu", ["50000000"], "Testcase Description"),
-    ("fdtd2d", "examples/FDTD-2D/fdtd2d.cu", ["-mb", "2000"], "Testcase Description"),
+    ("fdtd2d", "examples/FDTD-2D/fdtd2d.cu", ["-mb", "1000"], "Testcase Description"),
     ("gramschmidt", "examples/GRAMSCHM/gramschmidt.cu", [], "Testcase Description"),
-    ("needle", "examples/nw/needle.cu", ["-mb", "4000"], "Testcase Description"),
+    ("needle", "examples/nw/needle.cu", ["-mb", "2000"], "Testcase Description"),
     ("syr2k", "examples/SYR2K/syr2k.cu", [], "Testcase Description"),
     ("syrk", "examples/SYRK/syrk.cu", [], "Testcase Description"),
 ]

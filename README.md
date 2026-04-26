@@ -1,209 +1,289 @@
 # LLVM Compiler-Pass For Access Tracking in UVM GPUs
 
-This repository implements a lightweight, compiler-based memory tracking system for Unified Virtual Memory (UVM) on NVIDIA GPUs. Instead of relying on slow runtime sampling or heavily contended device-side memory tracking, this project uses an LLVM pass to statically analyze loop memory access patterns (via Scalar Evolution) and injects highly optimized, warp-aggregated tracking calls.
+This repository implements a lightweight, compiler-based memory tracking system for Unified Virtual Memory (UVM) on NVIDIA GPUs. Instead of relying on slow runtime sampling or heavily contended device-side memory tracking, this project uses an LLVM pass to statically analyze loop memory access patterns and injects highly optimized, warp-aggregated tracking calls.
 
-## Key Features
+## Artifact Directory Structure
+The artifact encompasses the compiler pass, runtime library, testing framework, and analysis tools. 
 
-- **Intelligent Compiler Instrumentation**: An LLVM 20 pass (`UvmTrackingPass.cpp`) that hoists and batches memory tracking calls out of tight loops whenever possible, drastically reducing runtime overhead.
-- **Warp-Aggregated Tracking**: The device-side tracking kernel (`libMarkAccess.cu`) uses a lock-free 3-level shadow page table and warp-level deduplication to minimize global memory atomics.
-- **Runtime Interception**: An `LD_PRELOAD` wrapper (`libMallocIntercept.cpp`) intercepts `cudaMalloc` and `cudaMallocManaged` to eagerly pre-populate the shadow page tables on the host, preventing fatal device-side `malloc` bottlenecks.
-- **Control Socket Thread**: A background host thread (`uvm_control_thread.cu`) enables you to dynamically toggle tracking, clear tracking state, and dump snapshots to disk via a UNIX domain socket.
-- **Deterministic Logging**: Exports dense binary files (`.pglog`) containing the exact 4KB pages touched by the GPU.
+- `UvmTrackingPass.cpp`: The core LLVM pass that analyzes PTX functions and instruments memory accesses statically.
+- `libMarkAccess.cu`: Device-side runtime kernel implementing the lock-free 3-level shadow page table and warp-level tracking logic.
+- `libMallocIntercept.cpp`: An `LD_PRELOAD` interceptor for CUDA allocation functions to eagerly pre-populate shadow tables.
+- `uvm_control_thread.cu` / `uvm_control_thread.h`: Host-side UNIX socket server and device kernels for dynamic tracking control.
+- `tests/`: Comprehensive test suite containing microbenchmarks, integration tests, and control thread tests.
+- `scripts/`: Utility scripts for benchmarking, log parsing, and analysis (`page_analysis.py`).
+- `benchmark.py`: Automation script for executing overhead benchmarks.
+- `pagelog_drill.py`: Interactive visualization dashboard for binary access logs.
 
-## Prerequisites
+## Setup Instructions
 
-- LLVM 20 (`llvm-20`, `clang++-20`)
-- NVIDIA CUDA Toolkit (installed at `/usr/local/cuda`)
-- NVIDIA GPU with UVM support
-- Python 3.x
+### CPU
+- **Requirements**: Multi-core x86_64 CPU.
+- **Details**: 4+ cores recommended to handle LLVM compilation and concurrent control thread execution efficiently.
 
-## Quick Start
+### Memory Required
+- **Requirements**: 16 GB+ RAM recommended.
+- **Details**: Required for compiling LLVM passes and backing the host-side allocations for the 3-level shadow page tables during large UVM memory tracking.
 
-1. **Build the compiler pass:**
-   ```bash
-   cd build
-   cmake .. -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm
-   make
-   ```
+### Storage Required
+- **Requirements**: ~20 GB free space.
+- **Details**: Storage is needed for the LLVM toolchain, CUDA toolkit, and the generated binary logs (`access_log.bin` can grow to several megabytes/gigabytes depending on the workload). No specific disk partition structure is required.
 
-2. **Instrument and compile a CUDA program:**
-   ```bash
-   clang++-20 -x cuda \
-     --cuda-gpu-arch=sm_$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d '.') \
-     -fgpu-rdc \
-     -fpass-plugin=./build/UvmTrackingPass.so \
-     ./my_kernel.cu ./libMarkAccess.cu \
-     --cuda-path=/usr/local/cuda \
-     -L/usr/local/cuda/lib64 -lcudart \
-     -o my_program
-   ```
+### Extra Hardware Required
+- **Requirements**: NVIDIA GPU with UVM support.
+- **Details**: Compute Capability 6.0 or higher is recommended (e.g., Pascal, Volta, Ampere, Hopper architectures).
 
-3. **Run with tracking enabled:**
-   ```bash
-   ./my_program
-   ```
+### Linux Kernel Compilation Instructions
+- **Details**: A standard Linux distribution kernel is sufficient. **Custom Linux kernel compilation is not required.** The UVM memory management is handled entirely by the proprietary NVIDIA driver, and our tracking logic operates at the compiler and CUDA runtime levels.
 
-4. **Visualize the results:**
-   ```bash
-   python3 -m venv env && source env/bin/activate
-   pip install dash numpy
-   python pagelog_drill.py build/access_log.bin
-   ```
-   Then open [http://127.0.0.1:8050](http://127.0.0.1:8050) in your browser.
+### OS
+- **Requirements**: Linux (Ubuntu 20.04 or Ubuntu 22.04 LTS recommended).
 
-## Project Structure
+### Software Dependencies
+- **Compilers/Toolchains**: 
+  - LLVM 20 (`llvm-20`, `clang++-20`)
+  - NVIDIA CUDA Toolkit (installed at `/usr/local/cuda`, e.g., 11.x or 12.x)
+  - `cmake` and `make`
+- **Python**: Python 3.x
+- **Python Packages**: `dash`, `numpy` (used for the visualization dashboard).
 
-- **`UvmTrackingPass.cpp`**: The LLVM pass that analyzes PTX functions and instruments memory accesses.
-- **`libMarkAccess.cu`**: Runtime kernel implementing `MarkAccess` and `BatchMarkAccess` with the 3-level shadow page table.
-- **`libMallocIntercept.cpp`**: `LD_PRELOAD` interceptor for CUDA allocation functions.
-- **`uvm_control_thread.cu` / `uvm_control_thread.h`**: UNIX socket server and device kernels for dynamic control.
-- **`tests/`**: Comprehensive test suite with custom `harness.py` for different tracking modes.
-- **`scripts/`**: Utility scripts for benchmarking and analysis (e.g., `benchmark_history.py`, `page_analysis.py`).
-- **`CMakeLists.txt`**: Build configuration for the pass and runtime objects.
+## Features/functionalities supported by your implementation
+
+### Compiler Instrumentation
+The core of our tracking system relies on an LLVM compiler pass. Rather than using slow, unoptimized memory polling or fault-based tracking, the compiler static analysis is utilized to optimize memory tracking calls directly within the application's PTX code, based on static code analysis.
+- **What it achieves**: Minimal runtime overhead by tracking memory accesses inline with the operations.
+- **Compile time optimizations**: It utilizes LLVM's Scalar Evolution (SCEV) to perform loop hoisting and batching. When it detects predictable, affine loop access patterns, it pulls the tracking calls out of tight inner loops, replacing them with a single, batched bounding-box tracking call.
+- **Modes of operation**: It can operate in a per-element tracking mode (for irregular accesses) or a batched mode (for regular, strided, or contiguous access patterns).
+
+### Pre-run Time Configuration
+Our implementation heavily relies on configurations that are applied prior to kernel launch, avoiding any need to recompile the user's application for different tracking behaviors.
+- **Environment variables and Wrappers**: Through `LD_PRELOAD`, we intercept `cudaMalloc` and `cudaMallocManaged` calls. This allows the host to eagerly pre-populate the 3-level shadow page table, drastically preventing device-side allocation bottlenecks.
+- Users can dynamically supply configuration flags and environment variables to orchestrate these memory allocations entirely before the GPU kernels are engaged.
+
+### Runtime Socket Control Plane
+A dedicated host-side background thread handles real-time configuration without pausing the primary execution pipeline.
+- **Runtime tweaking**: The UNIX domain socket enables you to dynamically `ENABLE` or `DISABLE` memory tracking at runtime, allowing selective tracking of specific execution phases.
+- **Controlling parameters**: You can use socket commands to flush memory tracking snapshots to disk (`SNAPSHOT`), clear existing tracking state (`CLEAR`), and configure other run-time behaviours without ever modifying the application's source code or stopping the execution.
+
+### Evaluation of Features & Test Scenarios
+
+| Feature | Test Scenario & Automation Script | Parameters | Objective | Expected Outcome | Findings / Notes |
+|---------|-----------------------------------|------------|-----------|------------------|------------------|
+| **Compiler Loop Hoisting & Batching** | Microbenchmarks<br>`python3 run_tests.py microbenchmarks` | Arrays up to N=10M, block sizes 128-512 | Verify memory tracking calls are correctly hoisted out of tight loops via Scalar Evolution. | Accurate page access counts with <5% overhead. | Successfully batches tracking in regular loops. Rare assertion failures possible if loop bounds are extremely non-deterministic, though correctness falls back to per-element tracking. |
+| **Warp-Aggregated Tracking** | Integration Tests<br>`python3 run_tests.py integration` | Multiple threads/blocks accessing overlapping pages | Ensure warp-level deduplication prevents excessive atomic contention on the shadow page table. | Consistent pagelogs, reduced global memory bottlenecking. | Dramatic reduction in tracking overhead compared to naive atomics. No deadlocks or crashes observed during standard operation. |
+| **Dynamic Control Socket** | Control Thread Tests<br>`python3 run_tests.py control_thread` | Socket commands: `ENABLE`, `DISABLE`, `SNAPSHOT`, `CLEAR` | Toggle tracking at runtime and dump memory snapshots without stopping the application. | Uninterrupted application flow; perfectly captures the instantaneous tracking state. | Socket communication is highly reliable. Dumping massive page tables (GBs) takes proportional I/O time but does not crash. |
+| **Eager Page Pre-population** | Preload Tests<br>`python3 run_tests.py thread_modes` | `LD_PRELOAD` enabled vs disabled | Prevent device-side `malloc` bottlenecks by eagerly allocating the shadow page table on the host. | Elimination of runtime latency spikes on first memory access by the GPU. | Successfully eliminates device-side stalls. Requires exactly matching the `LD_PRELOAD` shared library path in the environment. |
+
+## Assumptions and unsupported features
+
+**Assumptions:**
+- The target GPU supports Unified Memory (UVM) natively via NVIDIA drivers.
+- The instrumented applications allocate memory using standard `cudaMallocManaged` APIs.
+- The system has sufficient host memory to back the 3-level shadow page table.
+- The modes
+
+**Unsupported Features:**
+- Tracking standard host memory (`malloc` / `new`) that is not explicitly managed by CUDA UVM.
+- Executing the tracking runtime on non-NVIDIA GPUs (e.g., AMD ROCm/HIP is not supported).
+- Multi-GPU unified tracking is currently experimental and may not perfectly synchronize unified states across discrete devices without explicit peer-to-peer copies.
 
 ## Getting Started
 
-### 1. Build the Compiler Pass
+You can verify the basic functionality of the artifact within a few minutes using a "Hello world"-sized example.
 
-From the project root:
+### 1. Build the Artifact
+First, compile the LLVM tracking pass. From the repository root:
 ```bash
 cd build
 cmake .. -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm
 make
+cd ..
 ```
 
-### 2. Add Required API Calls to Your CUDA Program
-
-Before running any tracked kernel, add these three calls to your host code:
-
+### 2. Apply to a "Hello world" Example
+We will use a basic CUDA program. Create a file named `hello_uvm.cu`:
 ```cpp
-// 1. Initialize the tracking structure on the device
-init_tracking(&d_l1);
+#include "uvm_control_thread.h"
+#include <stdio.h>
 
-// --- your kernel launches here ---
+__global__ void touch_memory(int *arr) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    arr[idx] = idx * 2;
+}
 
-// 2. Export the log as human-readable text (for debugging)
-export_log(d_l1, "access_log.txt");
+int main() {
+    // 1. Initialize tracking
+    void* d_l1;
+    init_tracking(&d_l1);
 
-// 3. Export the log as binary (required for visualization)
-export_binary(d_l1, "access_log.bin");
+    // 2. Allocate UVM memory and launch kernel
+    int *managed_arr;
+    cudaMallocManaged(&managed_arr, 4096 * 10); // 10 pages
+    touch_memory<<<10, 256>>>(managed_arr);
+    cudaDeviceSynchronize();
+
+    // 3. Export the tracked accesses
+    export_binary(d_l1, "access_log.bin");
+    cudaFree(managed_arr);
+    printf("Done!\n");
+    return 0;
+}
 ```
 
-**Function Documentation:**
-- **`init_tracking`**: Allocates and initializes the device-side access log structure before kernels run.
-- **`export_log`**: Copies the log to host and writes human-readable text. Useful for quick inspection and debugging.
-- **`export_binary`**: Writes the log in compact binary format (consumed by `pagelog_drill.py`). **Required for dashboard visualization.**
-
-### 3. Instrument Your CUDA Program
-
-Compile with the instrumentation pass injected via `-fpass-plugin`:
-
+### 3. Compile and Run
+Compile the code using our compiler pass. Ensure the GPU architecture matches your system (the `nvidia-smi` snippet detects this automatically):
 ```bash
 clang++-20 -x cuda \
   --cuda-gpu-arch=sm_$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d '.') \
   -fgpu-rdc \
   -fpass-plugin=./build/UvmTrackingPass.so \
-  ./my_kernel.cu ./libMarkAccess.cu \
+  ./hello_uvm.cu ./libMarkAccess.cu \
   --cuda-path=/usr/local/cuda \
   -L/usr/local/cuda/lib64 -lcudart \
-  -o my_program
+  -o hello_uvm
 ```
 
-> **Note:** GPU architecture (`sm_XX`) is detected automatically at compile time.
-
-### 4. Run the Instrumented Binary
-
+Execute the binary:
 ```bash
-./my_program
+./hello_uvm
 ```
+This will run the program and generate an `access_log.bin` file in your current directory, confirming the basic functionality is working.
 
-This produces `build/access_log.bin` — a binary log of all tracked memory accesses.
+### Supplying Your Own Inputs
+To apply this tracking pass to your own CUDA applications:
+1. Include `uvm_control_thread.h` in your main source file.
+2. Call `init_tracking(&d_l1);` before your kernel launches.
+3. Call `export_binary(d_l1, "access_log.bin");` before your application exits.
+4. Compile your application exactly as shown in Step 3, passing your `.cu` files alongside `-fpass-plugin=./build/UvmTrackingPass.so` and `libMarkAccess.cu`.
 
-## Visualization & Analysis
+## Detailed Evaluation
 
-### Set Up the Python Environment
+### 1. Overhead Benchmarking
+- **Purpose**: Measure the runtime performance overhead imposed by the compiler instrumentation pass compared to a native, uninstrumented baseline execution.
+- **How to run**: `python3 benchmark.py --rebuild --mode <MODE>`
+    `<MODE>` can be:
+    - `no-preload`: Standard tracking where the device kernel coordinates tracking structures.
+    - `preload-alloc`: Eagerly allocates shadow tables on the host via `LD_PRELOAD`, can be configured on runtime to disable or enable device side allocating of tracking structures.
+    - `preload-only`: Pure host-side preloading without dynamic device-side tracking state instantiation.
+- **Estimated runtime**: 3-4 minutes.
+- **Expected result**: The script compiles and executes a suite of kernels, outputting the execution times for the Baseline vs. Tracked versions.
 
-```bash
-python3 -m venv testing_env
-source testing_env/bin/activate
-pip install dash numpy
-```
+- **How to access the result**: The results are printed directly to the terminal's standard output. If configured, it also saves a CSV or markdown summary inside the `perf_results/` directory.
 
-### Launch the Interactive Dashboard
+### 2. Access Log Correctness & Page Accuracy
+- **Purpose**: Verify that the tracking pass logs the exact 4KB pages touched by memory operations without dropping accesses or generating false positives.
+- **How to run**: `python3 run_tests.py`
+- **Estimated runtime**: < 2 minutes.
+- **Expected result**: All sub-suites (microbenchmarks, integration, etc.) will run and exit cleanly with status code `0`. The parsed binary pagelogs will perfectly match the expected analytical access patterns.
+- **How to access the result**: The console output from the test script will indicate `Test passed.` for each testing directory.
 
-```bash
-python pagelog_drill.py build/access_log.bin
-```
+### 3. Interactive Pagelog Visualization
+- **Purpose**: Demonstrate the ability to visually drill down into the tracked memory access patterns over the kernel execution space.
+- **How to run**: 
+  ```bash
+  python3 -m venv env
+  source env/bin/activate
+  pip install dash numpy
+  python pagelog_drill.py access_log.bin
+  ```
+- **Estimated runtime**: Instantaneous startup.
+- **Expected result**: A local web server initializes and hosts the Dash application with the parsed binary data.
+- **How to access the result**: Open a web browser and navigate to `http://127.0.0.1:8050`. You will see interactive plots displaying page access hot-spots.
 
-Open [http://127.0.0.1:8050](http://127.0.0.1:8050) to explore the access log interactively.
+### 4. Advanced Technical Details & Control Plane
 
-### Analyze Results from Snapshots
+For a detailed breakdown of compilation flags, `benchmark.py` parameters, environment variables for configuration, and the runtime UNIX domain socket control plane (`uvm_control_thread.cu`), please refer to the [Advanced Technical Documentation](#advanced-technical-documentation) section aheaf.
 
-Once you have dumped a snapshot (e.g., `results.pglog`), analyze it with:
+# Advanced Technical Documentation
 
-```bash
-python3 scripts/page_analysis.py /path/to/results.pglog
-```
+This document contains deep technical details about the UVM Access Tracking framework, including configuration flags, benchmarking parameters, and runtime control mechanisms.
 
-## Advanced Usage: Custom Applications with Control Thread
+## Benchmark & Compilation Configuration Flags
 
-To apply the UVM tracking pass to your own CUDA kernels with full control thread support, compile using `clang++-20` and load the LLVM pass plugin.
+To deeply evaluate the framework, `benchmark.py` provides numerous command-line arguments to customize the benchmarking runs. Under the hood, it also interacts with several C++ macro flags during compilation.
 
-### Compilation
+### `benchmark.py` Execution Flags
+- `[output_file]`: Positional argument for the output markdown filename (default: `results.md`).
+- `--rebuild`: Forces a clean rebuild of all standard and instrumented binaries.
+- `--generate-baseline`: Generates baseline binary pagelogs used for correctness checking.
+- `--check`: Runs pagelog correctness checks after benchmarks by comparing against the baselines.
+- `--preload`: Utilizes the `LD_PRELOAD` wrapper (`libMallocIntercept.so`) for eager malloc interception.
+- `--mode <no-preload|preload-alloc|preload-only>`: Determines the tracking mode for the compiled binaries (default: `no-preload`). This directly sets the `UVM_TRACKING_MODE` compilation macro.
+- `--iterations` / `-n <int>`: Number of iterations to run each benchmark for variance smoothing (default: 1).
+- `--metric <mean|median|min>`: The statistical metric used to compute overhead across multiple iterations (default: `mean`).
+- `--diff <FILE1> <FILE2>`: Compares two result markdown files and prints the differences in tracking overhead.
 
-Compile your kernels with the `-fpass-plugin` flag and link the runtime support files:
+### Compilation Flags (User Applications & `UvmTrackingPass`)
+When compiling your CUDA code alongside the `UvmTrackingPass.so` plugin, the following C++ macro flags are supported:
+- `-DTRACKING_ENABLED`: Enables the tracking runtime logic (including the background control socket thread and device kernel initialization).
+- `-DUVM_TRACKING_MODE=<0|1|2>`: Dictates how the tracking framework initializes memory:
+  - `0` (No Preload): Standard tracking where the device kernel coordinates tracking structures.
+  - `1` (Preload-Alloc): Eagerly allocates shadow tables on the host via `LD_PRELOAD`.
+  - `2` (Preload-Only): Pure host-side preloading without dynamic device-side tracking state instantiation.
 
-```bash
-clang++-20 -x cuda --cuda-gpu-arch=sm_80 -fgpu-rdc -O2 -rdynamic \
-    -fpass-plugin=./build/UvmTrackingPass.so \
-    -DTRACKING_ENABLED \
-    your_kernel.cu \
-    libMarkAccess.cu \
-    uvm_control_thread.cu \
-    -lcudart -o your_app
-```
+### Pass Build Flags
+- `-DUVM_DEBUG`: Passed during the CMake build of the `UvmTrackingPass.so` LLVM plugin itself to enable verbose LLVM `errs()` debugging outputs when running the static analysis over PTX code.
 
-### Runtime Execution
+## Runtime Control Plane (`uvm_control_thread.cu`)
 
-To eagerly allocate the shadow page table, run your application with the `LD_PRELOAD` wrapper:
+The `uvm_control_thread.cu` implementation spawns a background thread on the host alongside your instrumented application. This thread operates independently of the GPU kernels and listens on a UNIX domain socket (`/tmp/uvm-ctl.<pid>`) for real-time commands.
 
-```bash
-LD_PRELOAD=./build/libMallocIntercept.so ./your_app
-```
+### Environment Variables
+The control thread reads the following environment variable upon initialization:
+- `UVM_PRELOAD_MANAGED`: When set to `0`, disables eager pre-population of managed memory allocations even if the `LD_PRELOAD` wrapper is present. By default, or if unset, it defaults to `1` (enabled).
 
-### Controlling Tracking at Runtime
+### Supported Socket Commands
+You can interact with the control thread at runtime using tools like `nc` (netcat), `socat`, or custom Python scripts. The following commands are supported (commands should end with a newline):
 
-When your instrumented application starts, it spawns a background thread listening on `/tmp/uvm-ctl.<pid>`. Connect using `socat`, `nc`, or Python sockets to orchestrate tracking dynamically.
+- `ENABLE`: Turns on memory tracking globally (`uvm_tracking_set_enabled(1)`).
+- `DISABLE`: Turns off memory tracking globally (`uvm_tracking_set_enabled(0)`).
+- `MODE SKIP`: Sets tracking to skip unmapped memory pages on a cache miss, effectively avoiding device-side allocations (`uvm_tracking_set_skip_on_miss(1)`).
+- `MODE ALLOC`: Configures the tracking runtime to dynamically allocate missing L3 page tables on the device (`uvm_tracking_set_skip_on_miss(0)`).
+- `PRELOAD_MANAGED <0|1>`: Dynamically sets the `g_uvm_preload_managed` flag at runtime to intercept future `cudaMallocManaged` calls.
+- `SNAPSHOT <absolute_path>`: Flushes the current multi-level shadow page table tracking state into a binary pagelog file at the specified path.
+- `DROP_RANGE <hex-addr> <len>`: Instructs the runtime to drop the tracked shadow state for a specific memory range, typically used when memory is freed.
+- `STATUS`: Returns a detailed textual dump of the current internal configuration (e.g., tracking mode, preload flag status, pointer to the shadow L1 table).
+- `CLEAR`: Launches a GPU kernel (`uvm_clear_l3s_kernel`) to quickly zero out all bits in the allocated L3 bitmap shadow pages, essentially resetting the tracked access history without destroying the page table structure.
+- `SHUTDOWN`: Safely signals the control thread loop to terminate and exit.
 
-**Supported Socket Commands** (end with newline `\n`):
-- `ENABLE`: Turn on GPU tracking.
-- `DISABLE`: Turn off GPU tracking.
-- `STATUS`: Query current tracking mode and configurations.
-- `CLEAR`: Launch a device kernel to zero out tracking bitmaps.
-- `SNAPSHOT <absolute_path>`: Dump the tracked page table state to a file.
-- `PRELOAD_MANAGED <0|1>`: Toggle eager population of managed memory by `LD_PRELOAD`.
-- `SHUTDOWN`: Safely terminate the control thread.
+## Malloc Interception Wrapper (`libMallocIntercept.cpp`)
 
-## How It Works
+The framework provides an `LD_PRELOAD` shared library that hooks into native CUDA memory management APIs (`cudaMalloc`, `cudaMallocManaged`, `cudaFree`, `cudaDeviceSynchronize`) using `dlsym(RTLD_NEXT)`.
 
-1. **Compile-Time Instrumentation**: The LLVM pass (`UvmTrackingPass.so`) analyzes memory operations in GPU kernels and injects hoisted, batched tracking calls to minimize loop overhead.
+### Purpose & Mechanism
+When a GPU accesses a memory page for the first time during tracked execution, the shadow page table structure (L2 and L3 layers) must be dynamically allocated. If thousands of GPU threads attempt this simultaneously, the resulting lock contention on the device-side `malloc()` causes massive latency spikes. 
 
-2. **Runtime Tracking**: `libMarkAccess.cu` records accesses into a shared binary log using a lock-free 3-level shadow page table with warp-level deduplication to reduce global memory contention.
+The wrapper mitigates this by **eagerly pre-populating the host-side shadow page tables** the moment an allocation is made.
+- **Immediate Pre-population**: If the tracking structure (`g_uvm_shadow_l1`) is already initialized, intercepted allocations immediately trigger `uvm_tracking_preload_range()` to allocate the underlying table layers from the host.
+- **Pending Queue**: If an allocation is made *before* the application initializes the tracking runtime (via `init_tracking()`), the wrapper queues the pointer and size in a `g_pending` list. 
+- **Synchronization Trigger**: `cudaDeviceSynchronize` is intercepted to flush any pending allocations. Because `init_tracking()` ends with a synchronization barrier, this guarantees the queue is drained and preloaded right before any kernel launches.
+- **Cleanup**: `cudaFree` is intercepted to call `uvm_tracking_drop_range()`, ensuring shadow structures are correctly cleaned up to prevent tracking stale memory addresses.
 
-3. **Preload Interception**: The `LD_PRELOAD` interceptor eagerly populates the shadow page table on the host, preventing device-side allocation bottlenecks.
+### Related Environment Variables
+The wrapper reads the following environment variables during execution to adjust its behavior:
+- `UVM_PRELOAD_MANAGED`: When set to `0`, disables pre-population for memory allocated via `cudaMallocManaged`.
+- `UVM_PRELOAD_DEVICE`: When set to `0`, disables pre-population for memory allocated via standard `cudaMalloc`.
+- `UVM_NO_CONTROL_THREAD`: If set to `1`, prevents the wrapper from automatically spawning the `uvm_control_thread` in the background upon the first intercepted CUDA call.
 
-4. **Dynamic Control**: The control socket thread enables you to toggle tracking, clear state, and export snapshots without recompilation.
 
-5. **Visualization & Analysis**: `pagelog_drill.py` parses the binary log and renders an interactive dashboard for drill-down analysis of memory access patterns.
+## Advanced Use Case: Hybrid Tracking with Driver Page Faults
 
-## Testing
+While this repository focuses on compiler-based static instrumentation, another common approach to memory access tracking is **UVM driver page fault induction**. By artificially unmapping pages at the driver level, the resulting page faults can be intercepted to log accesses. 
 
-The project includes a comprehensive test suite covering control thread interaction, phase tracking, and different tracking modes (No-preload, Preload-Alloc, and Preload-Only).
+Both approaches have distinct trade-offs: instrumentation provides ultra-low overhead tracking of dense inner loops without kernel traps, while driver-level faulting offers a catch-all mechanism without requiring source recompilation. For advanced memory management tasks—such as periodic access sampling to inform smart prefetching and migration heuristics—these two paradigms can be unified into a powerful hybrid tracking system.
 
-```bash
-python3 run_tests.py
-```
+By leveraging the `uvm_control_thread` UNIX socket alongside a custom or modified UVM driver, you can create a bidirectional control plane where the driver and the user-space instrumentation coordinate tracking responsibilities dynamically.
 
-## Documentation
+### Segmented Tracking Responsibilities
+You can partition memory tracking based on the allocation type, playing to the strengths of each method:
 
-For a comprehensive deep dive into the methodology—including how the compiler pass classifies loop strides via Scalar Evolution and how `__shfl_xor_sync` warp-reductions operate—see the `architecture_summary.md` document (if available) or review the detailed comments in `UvmTrackingPass.cpp` and `libMarkAccess.cu`.
+* **Driver-Side Tracking for `cudaMallocManaged`**: The UVM driver can natively handle tracking for managed memory regions via page fault induction. Since managed memory inherently relies on driver intervention for migration and page mapping between the host and device, piggybacking access logging onto these existing driver routines is highly effective.
+* **Instrumentation for `cudaMalloc`**: Pure device allocations do not trigger UVM driver migrations. Instead of extending fault induction to device-side memory (which can be architecturally complex or unsupported), the compiler pass can exclusively track `cudaMalloc` regions. The `LD_PRELOAD` wrapper (`UVM_PRELOAD_DEVICE=1`) ensures these shadow tables are eagerly populated, yielding a complete access map without driver-level page faults.
+
+### Dynamic Overhead Shedding via Socket Control
+A hybrid setup allows the UVM driver (or a coordinating user-space daemon) to actively manage the overhead of the compiler instrumentation at runtime. 
+
+If the tracking framework is used to sample access patterns every few intervals to build a prefetching heuristic, continuous tracking becomes redundant once a region's "hotness" is established. The driver can communicate directly with the instrumentation's socket (`/tmp/uvm-ctl.<pid>`) to prune the tracking tree:
+
+1.  **Targeted Unmapping (`DROP_RANGE`)**: Once the driver has confidently modeled the access pattern of a specific memory range, it can issue a `DROP_RANGE <hex-addr> <len>` command to the socket. The instrumentation runtime will drop the shadow state for that range, instantly eliminating the device-side tracking overhead for those specific addresses while continuing to track unknown regions.
+2.  **Interval Sampling (`ENABLE` / `SNAPSHOT` / `DISABLE`)**: The driver can act as a choreographer, pulsing the `ENABLE` and `DISABLE` socket commands to sample compiler-instrumented accesses during specific execution windows. By calling `SNAPSHOT` at the end of a window, the driver merges the instrumentation's warp-aggregated logs with its own page fault logs to generate a comprehensive, global access heatmap. 
+3.  **State Resets (`CLEAR`)**: Between sampling intervals, the driver can issue a `CLEAR` command to zero-out the L3 shadow bitmaps. This allows the system to establish fresh access epochs for dynamic workloads without the overhead of tearing down and reallocating the underlying page tables.
