@@ -96,19 +96,25 @@ def compile(src, out, *,
             instrumented=True,
             mode=0,
             rdynamic=False,
-            force=False):
+            control_thread=True,
+            extra_flags=None,
+            force=False,
+            dry_run=False):
     """
     Compile a CUDA source file, skipping if outputs are up-to-date.
 
     Parameters
     ----------
-    src          : path to .cu source (absolute, or relative to project root)
-    out          : output binary path
-    instrumented : inject the UVM tracking pass (default True)
-    mode         : tracking mode — 0 no-preload, 1 preload-alloc, 2 preload-only
-                   (adds -DUVM_TRACKING_MODE=N for N > 0)
-    rdynamic     : add -rdynamic (required for LD_PRELOAD modes)
-    force        : rebuild even when outputs are fresh
+    src            : path to .cu source (absolute, or relative to project root)
+    out            : output binary path
+    instrumented   : inject the UVM tracking pass (default True)
+    mode           : tracking mode — 0 no-preload, 1 preload-alloc, 2 preload-only
+                     (adds -DUVM_TRACKING_MODE=N for N > 0)
+    rdynamic       : add -rdynamic (required for LD_PRELOAD modes)
+    control_thread : include control thread (default True; False adds -DUVM_NO_CONTROL_THREAD)
+    extra_flags    : list of additional compiler flags to append
+    force          : rebuild even when outputs are fresh
+    dry_run        : print command without executing
 
     Returns
     -------
@@ -130,14 +136,24 @@ def compile(src, out, *,
     if instrumented:
         if mode > 0:
             flags.append(f"-DUVM_TRACKING_MODE={mode}")
+        if not control_thread:
+            flags.append("-DUVM_NO_CONTROL_THREAD")
         flags += [
             "-DTRACKING_ENABLED",
             f"-fpass-plugin={PASS_PATH}",
             LIB_PATH,
-            CTL_PATH,
         ]
+        if control_thread:
+            flags.append(CTL_PATH)
 
     flags += ["-o", out]
+
+    if extra_flags:
+        flags.extend(extra_flags)
+
+    if dry_run:
+        print(" ".join([CLANG] + flags))
+        return True, ""
 
     r = subprocess.run([CLANG] + flags,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,

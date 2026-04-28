@@ -521,6 +521,9 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
         return PreservedAnalyses::all();
     if (M.getSourceFileName().find("libMarkAccess") != std::string::npos)
         return PreservedAnalyses::all();
+    if(M.getSourceFileName().find("uvm_control_thread") != std::string::npos)
+        return PreservedAnalyses::all();
+        UVM_DBGS() << "[UvmPass] Running on module with empty source filename\n";
 
     UVM_DBGS() << "[UvmPass] Running on module: " << M.getSourceFileName() << "\n";
 

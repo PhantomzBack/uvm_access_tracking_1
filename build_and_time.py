@@ -7,6 +7,9 @@ Replaces build_and_time.sh with a Pythonic interface supporting:
   - Both instrumented and normal binaries
   - Automatic timing and overhead calculation
   - Convenient flags for quick iteration
+  - Control thread configuration
+  - Additional compiler flags
+  - Dry run mode for command inspection
 
 Usage
 -----
@@ -26,6 +29,12 @@ Options
         Rebuild even if outputs are fresh
     --timeout SECONDS
         Timeout for kernel runs (default: 60)
+    --no-control-thread
+        Disable control thread (adds -DUVM_NO_CONTROL_THREAD)
+    --extra-flags FLAGS
+        Additional compiler flags (space-separated)
+    --dry-run
+        Print compilation commands without executing
 
 Examples
 --------
@@ -37,6 +46,12 @@ Examples
 
     # Force rebuild and quick benchmark:
     ./build_and_time.py examples/benchmark_kernel_single.cu --force --run
+    
+    # Dry run to see compilation commands:
+    ./build_and_time.py examples/benchmark_kernel_single.cu --dry-run
+    
+    # Disable control thread:
+    ./build_and_time.py examples/benchmark_kernel_single.cu --no-control-thread
 """
 
 import argparse
@@ -103,6 +118,26 @@ def parse_args():
         help="Timeout for kernel runs (default: 60)"
     )
     
+    parser.add_argument(
+        "--no-control-thread",
+        action="store_true",
+        help="Disable control thread (adds -DUVM_NO_CONTROL_THREAD)"
+    )
+    
+    parser.add_argument(
+        "--extra-flags",
+        type=str,
+        default="",
+        metavar="FLAGS",
+        help="Additional compiler flags (space-separated)"
+    )
+    
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print compilation commands without executing"
+    )
+    
     args = parser.parse_args()
     
     # Validate that we don't skip both
@@ -141,10 +176,12 @@ def get_output_paths(source, mode):
     return str(normal_exe), str(instrumented_exe)
 
 
-def compile_binaries(source, normal_exe, instrumented_exe, mode, force, skip_normal, skip_instrumented):
+def compile_binaries(source, normal_exe, instrumented_exe, mode, force, skip_normal, skip_instrumented, 
+                     control_thread=True, extra_flags=None, dry_run=False):
     """Compile normal and instrumented versions."""
     tracking_mode = mode_to_tracking_mode(mode)
     use_preload = mode != "no-preload"
+    extra_flags_list = extra_flags.split() if extra_flags else None
     
     results = {}
     
@@ -157,12 +194,18 @@ def compile_binaries(source, normal_exe, instrumented_exe, mode, force, skip_nor
             instrumented=True,
             mode=tracking_mode,
             rdynamic=use_preload,
-            force=force
+            control_thread=control_thread,
+            extra_flags=extra_flags_list,
+            force=force,
+            dry_run=dry_run
         )
         elapsed = time.time() - start
         
         if ok:
-            print(f"  ✓ Built in {elapsed:.2f}s")
+            if dry_run:
+                print(f"  (dry run)")
+            else:
+                print(f"  ✓ Built in {elapsed:.2f}s")
             results["instrumented"] = (instrumented_exe, True)
         else:
             print(f"  ✗ Failed")
@@ -176,12 +219,17 @@ def compile_binaries(source, normal_exe, instrumented_exe, mode, force, skip_nor
             source,
             normal_exe,
             instrumented=False,
-            force=force
+            extra_flags=extra_flags_list,
+            force=force,
+            dry_run=dry_run
         )
         elapsed = time.time() - start
         
         if ok:
-            print(f"  ✓ Built in {elapsed:.2f}s")
+            if dry_run:
+                print(f"  (dry run)")
+            else:
+                print(f"  ✓ Built in {elapsed:.2f}s")
             results["normal"] = (normal_exe, True)
         else:
             print(f"  ✗ Failed")
@@ -285,6 +333,8 @@ def main():
     # Compile
     skip_normal = args.instrumented_only
     skip_instrumented = args.normal_only
+
+    print(args.extra_flags)
     
     results = compile_binaries(
         str(source),
@@ -293,7 +343,10 @@ def main():
         args.mode,
         args.force,
         skip_normal,
-        skip_instrumented
+        skip_instrumented,
+        control_thread=not args.no_control_thread,
+        extra_flags=args.extra_flags,
+        dry_run=args.dry_run
     )
     
     # Check if compilation succeeded

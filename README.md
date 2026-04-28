@@ -132,7 +132,7 @@ int main() {
 ### 3. Compile and Run
 Compile the code using our compiler pass. Ensure the GPU architecture matches your system (the `nvidia-smi` snippet detects this automatically):
 ```bash
-clang++-20 -x cuda \
+clang++-20 -O2 -x cuda \
   --cuda-gpu-arch=sm_$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d '.') \
   -fgpu-rdc \
   -fpass-plugin=./build/UvmTrackingPass.so \
@@ -141,6 +141,8 @@ clang++-20 -x cuda \
   -L/usr/local/cuda/lib64 -lcudart \
   -o hello_uvm
 ```
+
+> Note: Running with -O2 is imperative since otherwise mem2reg runs after the compiler pass, which is very problematic since you would get many many more store instructions.
 
 Execute the binary:
 ```bash
@@ -222,6 +224,67 @@ When compiling your CUDA code alongside the `UvmTrackingPass.so` plugin, the fol
 
 ### Pass Build Flags
 - `-DUVM_DEBUG`: Passed during the CMake build of the `UvmTrackingPass.so` LLVM plugin itself to enable verbose LLVM `errs()` debugging outputs when running the static analysis over PTX code.
+
+### `build_and_time.py` — Simplified Compilation Harness
+
+For convenience, `build_and_time.py` provides a streamlined Python interface for compiling and benchmarking CUDA kernels with the tracking pass. This tool automates the compilation of both normal (uninstrumented) and instrumented binaries, measures their execution times, and computes the tracking overhead.
+
+#### Usage
+
+```
+usage: build_and_time.py [-h] [--mode {no-preload,preload-alloc,preload-only}] [--run] [--normal-only]
+                         [--instrumented-only] [--force] [--timeout SECONDS] [--no-control-thread]
+                         [--extra-flags FLAGS] [--dry-run]
+                         SOURCE
+
+Compile and optionally benchmark CUDA kernels with UVM tracking.
+
+positional arguments:
+  SOURCE                Path to CUDA source file (.cu)
+
+options:
+  -h, --help            show this help message and exit
+  --mode {no-preload,preload-alloc,preload-only}
+                        Tracking mode (default: no-preload)
+  --run                 Compile both versions and run benchmarks
+  --normal-only         Skip instrumented compilation
+  --instrumented-only   Skip normal compilation
+  --force               Rebuild even if outputs are fresh
+  --timeout SECONDS     Timeout for kernel runs (default: 60)
+  --no-control-thread   Disable control thread (adds -DUVM_NO_CONTROL_THREAD)
+  --extra-flags FLAGS   Additional compiler flags (space-separated)
+  --dry-run             Print compilation commands without executing
+```
+
+#### Examples
+
+**Basic compilation in default (no-preload) mode:**
+```bash
+python3 build_and_time.py examples/benchmark_kernel.cu
+```
+
+**Compile and run benchmarks with execution timing:**
+```bash
+python3 build_and_time.py examples/benchmark_kernel.cu --run
+```
+
+**Preload-only mode with custom include paths:**
+```bash
+python3 build_and_time.py examples/sgemm/sgemm_cutlass.cu \
+  --mode preload-only \
+  --no-control-thread \
+  --extra-flags="-I./examples/sgemm -I/YOUR/CUTLASS/INCLUDE/PATH"
+```
+
+**Dry run to inspect compilation commands:**
+```bash
+python3 build_and_time.py examples/benchmark_kernel.cu --dry-run --no-control-thread
+```
+
+**Force rebuild with specific tracking mode:**
+```bash
+python3 build_and_time.py examples/benchmark_kernel.cu --force --mode preload-alloc
+```
 
 ## Runtime Control Plane (`uvm_control_thread.cu`)
 
