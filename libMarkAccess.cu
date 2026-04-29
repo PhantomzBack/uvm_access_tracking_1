@@ -3,6 +3,18 @@
 #include "uvm_control_thread.h"
 #include <mutex>
 
+#ifdef IGNORE_NON_GLOBAL
+#pragma message("MarkAccess: IGNORE_NON_GLOBAL is defined, non-global accesses will be ignored")
+#endif
+
+#if UVM_TRACKING_MODE == 2
+#pragma message("UVM_TRACKING_MODE=2: PRELOAD_ONLY mode (GPU will not allocate L2/L3, only track accesses to preloaded ranges)")
+#elif UVM_TRACKING_MODE == 1
+#pragma message("UVM_TRACKING_MODE=1: FULL mode (GPU will allocate L2/L3 and track all accesses, depending on g_skip_on_miss)")
+#else
+#pragma message("UVM_TRACKING_MODE=0: NO PRELOAD mode (GPU will allocate L2/L3 and track all accesses, but preloading is disabled so initial accesses may be missed)")
+#endif
+
 __device__ inline unsigned int my_match_any_sync(unsigned int mask, int value) {
 #if __CUDA_ARCH__ >= 700
     return __match_any_sync(mask, value);
@@ -106,6 +118,12 @@ extern "C" {
             LOG("[MarkAccess] shadow_l1 not initialised %p\n", shadow_l1);
             return;
         }
+#ifdef IGNORE_NON_GLOBAL
+        if(!__isGlobal((const void*)addr)) {
+            LOG("[MarkAccess] ignoring non-global access at %p\n", (void*)addr);
+            return;
+        }
+#endif // IGNORE_NON_GLOBAL
 
         // Decompose address
         uint32_t l1_idx    = (addr >> L1_SHIFT) & L1_MASK;
@@ -310,7 +328,7 @@ extern "C" {
         if (tid < n)
             out[tid] = ((unsigned long long*)((void**)l1[l1_idx])[l2_idx])[tid];
         if (tid == n-1)
-            LOG("[copy_l2_to_host] successful\n");
+            LOG("[copy_l3_to_host] successful\n");
 
     }
 }
@@ -387,6 +405,8 @@ extern "C" void uvm_tracking_preload_range(uintptr_t start, size_t size)
     // The CPU can read/write the page-table tree directly — no cudaMemcpy
     // round-trips are needed for L1/L2.  L3 bitmaps remain device memory so
     // that GPU atomicOr is as fast as possible.
+    LOG("[uvm_tracking_preload_range] mode 2: preloading range [%p, %p] (L1 %u to %u)\\n",
+        (void*)start, (void*)end, l1_start, l1_end);
     void*** l1_table = (void***)g_uvm_shadow_l1;
 
     for (uint32_t li = l1_start; li <= l1_end; ++li) {
