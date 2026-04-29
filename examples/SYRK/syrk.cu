@@ -208,16 +208,15 @@ int main(int argc, char *argv[])
 	// fprintf(stdout, "CPU Runtime: %0.6lfs\n", t_end - t_start);
 
 	// compareResults(C, C_gpu);
+#ifdef TRACKING_ENABLED
+        export_binary(d_l1, "access_log.bin");
+        cudaFree(d_l1);
+#endif
+    free(A);
+    free(C);
+    cudaFree(A_gpu);
+    cudaFree(C_gpu);
 
-	free(A);
-	free(C);
-	cudaFree(A_gpu);
-	cudaFree(C_gpu);
-
-	#ifdef TRACKING_ENABLED
-	export_binary(d_l1, "access_log.bin");
-	cudaFree(d_l1);
-	#endif
-	return 0;
+    return 0;
 }
 

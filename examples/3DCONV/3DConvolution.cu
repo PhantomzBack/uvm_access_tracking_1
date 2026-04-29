@@ -247,10 +247,14 @@ int main(int argc, char *argv[])
 
 	free(A);
 	free(B);
+	
+	#ifdef TRACKING_ENABLED
+	export_binary(d_l1, "access_log.bin");
+	#endif
+	
 	cudaFree(A_gpu);
 	cudaFree(B_gpu);
 	#ifdef TRACKING_ENABLED
-	export_binary(d_l1, "access_log.bin");
 	cudaFree(d_l1);
 	#endif
 

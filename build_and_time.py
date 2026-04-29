@@ -4,6 +4,7 @@ build_and_time.py — Modern build and timing harness using shared compilation u
 
 Replaces build_and_time.sh with a Pythonic interface supporting:
   - Multiple compilation modes (no-preload, preload-alloc, preload-only)
+  - Batch compilation across multiple modes in a single invocation
   - Both instrumented and normal binaries
   - Automatic timing and overhead calculation
   - Convenient flags for quick iteration
@@ -17,8 +18,10 @@ Usage
 
 Options
 -------
-    --mode {no-preload,preload-alloc,preload-only}
-        Tracking mode (default: no-preload)
+    --mode MODE
+        Tracking mode (default: no-preload). Can be:
+        - Single mode: "no-preload", "preload-alloc", "preload-only", "0", "1", "2"
+        - Multiple modes: "{no-preload,preload-alloc}", "{0,1,2}", "{0,preload-only}"
     --run
         Compile both versions and run benchmarks
     --normal-only
@@ -38,20 +41,29 @@ Options
 
 Examples
 --------
-    # Compile in no-preload mode:
-    ./build_and_time.py examples/benchmark_kernel_single.cu
+    # Compile in no-preload mode (default):
+    ./build_and_time.py examples/benchmark_kernel.cu
+
+    # Compile in preload-alloc mode:
+    ./build_and_time.py examples/benchmark_kernel.cu --mode preload-alloc
+
+    # Compile in preload-alloc mode using index:
+    ./build_and_time.py examples/benchmark_kernel.cu --mode 1
+
+    # Compile all three modes:
+    ./build_and_time.py examples/benchmark_kernel.cu --mode "{0,1,2}"
+    
+    # Compile multiple modes with names:
+    ./build_and_time.py examples/benchmark_kernel.cu --mode "{no-preload,preload-only}"
 
     # Compile and run benchmarks in preload-alloc mode:
-    ./build_and_time.py examples/benchmark_kernel_single.cu --mode preload-alloc --run
+    ./build_and_time.py examples/benchmark_kernel.cu --mode preload-alloc --run
 
-    # Force rebuild and quick benchmark:
-    ./build_and_time.py examples/benchmark_kernel_single.cu --force --run
-    
-    # Dry run to see compilation commands:
-    ./build_and_time.py examples/benchmark_kernel_single.cu --dry-run
+    # Dry run to inspect all compilation commands for modes 0 and 2:
+    ./build_and_time.py examples/benchmark_kernel.cu --mode "{0,2}" --dry-run
     
     # Disable control thread:
-    ./build_and_time.py examples/benchmark_kernel_single.cu --no-control-thread
+    ./build_and_time.py examples/benchmark_kernel.cu --no-control-thread
 """
 
 import argparse
@@ -81,9 +93,11 @@ def parse_args():
     
     parser.add_argument(
         "--mode",
-        choices=["no-preload", "preload-alloc", "preload-only"],
+        type=str,
         default="no-preload",
-        help="Tracking mode (default: no-preload)"
+        metavar="MODE",
+        help="Tracking mode (default: no-preload). Can be a single mode (no-preload, preload-alloc, preload-only)"
+             " or index (0, 1, 2), or multiple modes in braces (e.g., {no-preload,preload-alloc} or {0,2})"
     )
     
     parser.add_argument(
@@ -148,13 +162,55 @@ def parse_args():
 
 
 def mode_to_tracking_mode(mode_str):
-    """Convert mode string to harness tracking mode integer."""
+    """Convert mode string or index to harness tracking mode integer."""
     mapping = {
         "no-preload": 0,
         "preload-alloc": 1,
         "preload-only": 2,
+        "0": 0,
+        "1": 1,
+        "2": 2,
     }
+    if mode_str not in mapping:
+        raise ValueError(f"Unknown mode: {mode_str}")
     return mapping[mode_str]
+
+
+def parse_modes(mode_str):
+    """
+    Parse mode argument which can be:
+    - Single mode: "no-preload" or "0"
+    - Multiple modes in braces: "{no-preload,preload-alloc}" or "{0,1,2}"
+    
+    Returns a list of mode strings (e.g., ["no-preload", "preload-alloc"])
+    """
+    mode_str = mode_str.strip()
+    
+    # Check if multiple modes are specified in braces
+    if mode_str.startswith("{") and mode_str.endswith("}"):
+        modes_raw = mode_str[1:-1].split(",")
+        modes = [m.strip() for m in modes_raw]
+    else:
+        modes = [mode_str]
+    
+    # Validate and expand indices to names
+    mode_names = []
+    index_to_name = {
+        "0": "no-preload",
+        "1": "preload-alloc",
+        "2": "preload-only",
+    }
+    
+    for mode in modes:
+        if mode in index_to_name:
+            # Convert index to name
+            mode_names.append(index_to_name[mode])
+        elif mode in ["no-preload", "preload-alloc", "preload-only"]:
+            mode_names.append(mode)
+        else:
+            raise ValueError(f"Invalid mode: {mode}. Must be one of: no-preload, preload-alloc, preload-only, 0, 1, 2")
+    
+    return mode_names
 
 
 def get_output_paths(source, mode):
@@ -324,44 +380,60 @@ def main():
         print(f"Error: Source file not found: {args.source}", file=sys.stderr)
         return 1
     
-    print(f"Source: {source}")
-    print(f"Mode:   {args.mode}")
+    # Parse modes (single or multiple)
+    try:
+        modes = parse_modes(args.mode)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
     
-    # Get output paths
-    normal_exe, instrumented_exe = get_output_paths(args.source, args.mode)
+    print(f"Source: {source}")
+    if len(modes) == 1:
+        print(f"Mode:   {modes[0]}")
+    else:
+        print(f"Modes:  {', '.join(modes)}")
     
     # Compile
     skip_normal = args.instrumented_only
     skip_instrumented = args.normal_only
-
-    print(args.extra_flags)
     
-    results = compile_binaries(
-        str(source),
-        normal_exe,
-        instrumented_exe,
-        args.mode,
-        args.force,
-        skip_normal,
-        skip_instrumented,
-        control_thread=not args.no_control_thread,
-        extra_flags=args.extra_flags,
-        dry_run=args.dry_run
-    )
+    all_success = True
     
-    # Check if compilation succeeded
-    compile_ok = all(success for _, success in results.values())
-    if not compile_ok:
-        print("\nCompilation failed.", file=sys.stderr)
-        return 1
+    for mode in modes:
+        print(f"\n{'=' * 60}")
+        print(f"Compiling for mode: {mode}")
+        print(f"{'=' * 60}")
+        
+        # Get output paths for this mode
+        normal_exe, instrumented_exe = get_output_paths(args.source, mode)
+        
+        results = compile_binaries(
+            str(source),
+            normal_exe,
+            instrumented_exe,
+            mode,
+            args.force,
+            skip_normal,
+            skip_instrumented,
+            control_thread=not args.no_control_thread,
+            extra_flags=args.extra_flags,
+            dry_run=args.dry_run
+        )
+        
+        # Check if compilation succeeded
+        compile_ok = all(success for _, success in results.values())
+        if not compile_ok:
+            print(f"\nCompilation failed for mode: {mode}", file=sys.stderr)
+            all_success = False
+            continue
+        
+        # Run benchmarks if requested
+        if args.run:
+            times = run_benchmarks(results, mode, args.timeout)
+            if times is None:
+                all_success = False
     
-    # Run benchmarks if requested
-    if args.run:
-        times = run_benchmarks(results, args.mode, args.timeout)
-        if times is None:
-            return 1
-    
-    return 0
+    return 0 if all_success else 1
 
 
 if __name__ == "__main__":

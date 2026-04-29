@@ -305,12 +305,14 @@ int runTest(int argc, char** argv)
     fclose(fpo);
 
 #endif
-
-    cudaFree(reference_cuda);
-    cudaFree(input_itemsets);
     #ifdef TRACKING_ENABLED
 	export_binary(d_l1, "access_log.bin");
+	#endif
+	cudaFree(reference_cuda);
+    cudaFree(input_itemsets);
+    #ifdef TRACKING_ENABLED
 	cudaFree(d_l1);
 	#endif
+
     return EXIT_SUCCESS;
 }

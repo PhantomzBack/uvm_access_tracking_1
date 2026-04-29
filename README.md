@@ -227,12 +227,12 @@ When compiling your CUDA code alongside the `UvmTrackingPass.so` plugin, the fol
 
 ### `build_and_time.py` — Simplified Compilation Harness
 
-For convenience, `build_and_time.py` provides a streamlined Python interface for compiling and benchmarking CUDA kernels with the tracking pass. This tool automates the compilation of both normal (uninstrumented) and instrumented binaries, measures their execution times, and computes the tracking overhead.
+For convenience, `build_and_time.py` provides a streamlined Python interface for compiling and benchmarking CUDA kernels with the tracking pass. This tool automates the compilation of both normal (uninstrumented) and instrumented binaries, measures their execution times, and computes the tracking overhead. It also supports batch compilation across multiple tracking modes in a single invocation.
 
 #### Usage
 
 ```
-usage: build_and_time.py [-h] [--mode {no-preload,preload-alloc,preload-only}] [--run] [--normal-only]
+usage: build_and_time.py [-h] [--mode MODE] [--run] [--normal-only]
                          [--instrumented-only] [--force] [--timeout SECONDS] [--no-control-thread]
                          [--extra-flags FLAGS] [--dry-run]
                          SOURCE
@@ -244,8 +244,9 @@ positional arguments:
 
 options:
   -h, --help            show this help message and exit
-  --mode {no-preload,preload-alloc,preload-only}
-                        Tracking mode (default: no-preload)
+  --mode MODE           Tracking mode (default: no-preload). Can be a single mode 
+                        (no-preload, preload-alloc, preload-only) or index (0, 1, 2),
+                        or multiple modes in braces (e.g., {no-preload,preload-alloc} or {0,2})
   --run                 Compile both versions and run benchmarks
   --normal-only         Skip instrumented compilation
   --instrumented-only   Skip normal compilation
@@ -256,6 +257,15 @@ options:
   --dry-run             Print compilation commands without executing
 ```
 
+#### Mode Specification
+
+The `--mode` parameter is flexible:
+
+- **Single mode by name**: `--mode no-preload`, `--mode preload-alloc`, `--mode preload-only`
+- **Single mode by index**: `--mode 0` (no-preload), `--mode 1` (preload-alloc), `--mode 2` (preload-only)
+- **Multiple modes**: `--mode "{0,1,2}"` or `--mode "{no-preload,preload-alloc,preload-only}"`
+- **Mixed syntax**: `--mode "{0,preload-alloc,2}"` (indices and names can be mixed)
+
 #### Examples
 
 **Basic compilation in default (no-preload) mode:**
@@ -263,9 +273,24 @@ options:
 python3 build_and_time.py examples/benchmark_kernel.cu
 ```
 
+**Compile using mode index:**
+```bash
+python3 build_and_time.py examples/benchmark_kernel.cu --mode 1
+```
+
 **Compile and run benchmarks with execution timing:**
 ```bash
 python3 build_and_time.py examples/benchmark_kernel.cu --run
+```
+
+**Compile all three modes in one invocation:**
+```bash
+python3 build_and_time.py examples/benchmark_kernel.cu --mode "{0,1,2}"
+```
+
+**Compile multiple modes with execution and overhead measurement:**
+```bash
+python3 build_and_time.py examples/benchmark_kernel.cu --mode "{0,1,2}" --run
 ```
 
 **Preload-only mode with custom include paths:**
@@ -276,15 +301,16 @@ python3 build_and_time.py examples/sgemm/sgemm_cutlass.cu \
   --extra-flags="-I./examples/sgemm -I/YOUR/CUTLASS/INCLUDE/PATH"
 ```
 
-**Dry run to inspect compilation commands:**
+**Dry run to inspect compilation commands for multiple modes:**
 ```bash
-python3 build_and_time.py examples/benchmark_kernel.cu --dry-run --no-control-thread
+python3 build_and_time.py examples/benchmark_kernel.cu --mode "{no-preload,preload-only}" --dry-run
 ```
 
 **Force rebuild with specific tracking mode:**
 ```bash
 python3 build_and_time.py examples/benchmark_kernel.cu --force --mode preload-alloc
 ```
+
 
 ## Runtime Control Plane (`uvm_control_thread.cu`)
 

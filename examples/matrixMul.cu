@@ -155,12 +155,10 @@ int main(int argc, char **argv)
         if (rel > 1e-4f) { printf("  mismatch[%d]: %.6f vs %.6f\n", i, h_C[i], ref); bad++; }
     }
     printf("Correctness: %s\n", bad == 0 ? "PASS" : "FAIL");
-
 #ifdef TRACKING_ENABLED
     export_binary(d_l1, "access_log.bin");
     cudaFree(d_l1);
 #endif
-
     CUDA_CHECK(cudaFreeHost(h_A));
     CUDA_CHECK(cudaFreeHost(h_B));
     CUDA_CHECK(cudaFreeHost(h_C));
@@ -170,5 +168,7 @@ int main(int argc, char **argv)
     CUDA_CHECK(cudaEventDestroy(ev_start));
     CUDA_CHECK(cudaEventDestroy(ev_stop));
     CUDA_CHECK(cudaStreamDestroy(stream));
+
+
     return EXIT_SUCCESS;
 }

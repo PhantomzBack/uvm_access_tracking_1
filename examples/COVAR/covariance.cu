@@ -271,11 +271,14 @@ int main(int argc, char *argv[])
 	free(symmat);
 	free(mean);
 
+	#ifdef TRACKING_ENABLED
+	export_binary(d_l1, "access_log.bin");
+	#endif
+
 	cudaFree(data_gpu);
 	cudaFree(symmat_gpu);
 	cudaFree(mean_gpu);
 	#ifdef TRACKING_ENABLED
-	export_binary(d_l1, "access_log.bin");
 	cudaFree(d_l1);
 	#endif
   	return 0;

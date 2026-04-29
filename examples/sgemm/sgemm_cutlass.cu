@@ -151,7 +151,10 @@ void matrixMultiply(unsigned long arr_dim) {
 
     int block_size = 32;
     sMatrixSize matrix_size;
-
+#ifdef TRACKING_ENABLED
+    void*** d_l1;
+    init_tracking(&d_l1);
+#endif 
     // set seed for rand()
     srand(2006);
 
@@ -269,6 +272,11 @@ void matrixMultiply(unsigned long arr_dim) {
     if (copy_back_output)
         TOUCH_ARRAY(u_C, mem_size_C);
 
+#ifdef TRACKING_ENABLED
+    printf("Execution time from clock(): %f s\n", ((float)(end - start)) / CLOCKS_PER_SEC);
+    export_binary(d_l1, "access_log.bin");
+    cudaFree(d_l1);
+#endif
     // clean up memory
     cudaFree(u_A);
     cudaFree(u_B);
@@ -307,18 +315,10 @@ int main(int argc, char **argv)
     printf("%s: array is %lu * %lu | memory %lu MB\n", __FILE__, arr_dim, arr_dim,
         mem_footprint / 1000000);
     
-#ifdef TRACKING_ENABLED
-    void*** d_l1;
-    init_tracking(&d_l1);
-#endif 
+
     int start = clock();
     matrixMultiply(arr_dim);
     int end = clock();
-#ifdef TRACKING_ENABLED
-    printf("Execution time from clock(): %f s\n", ((float)(end - start)) / CLOCKS_PER_SEC);
-    export_binary(d_l1, "access_log.bin");
-    cudaFree(d_l1);
-#endif
 
     return 0;
 }

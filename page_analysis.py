@@ -77,8 +77,8 @@ def analyze_pages(filepath, print_pages=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Analyze UVM access tracking pagelogs.")
-    parser.add_argument("file", nargs="?", default="test_log.bin",
-                        help="Path to pagelog file (default: test_log.bin)")
+    parser.add_argument("file", nargs="?", default="access_log.bin",
+                        help="Path to pagelog file (default: access_log.bin)")
     parser.add_argument("-p", "--print-pages", action="store_true",
                         help="Print the hex address of every touched page")
     args = parser.parse_args()

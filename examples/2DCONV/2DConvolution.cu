@@ -343,13 +343,14 @@ int main(int argc, char *argv[])
 		        t_end - t_after_array_init, target >> 20);
 	free(A);
 	free(B);
-	cudaFree(A_gpu);
-	cudaFree(B_gpu);
 
 #ifdef TRACKING_ENABLED
 	export_binary(d_l1, "access_log.bin");
 	cudaFree(d_l1);
 #endif
+
+	cudaFree(A_gpu);
+	cudaFree(B_gpu);
 	
 	return 0;
 }
