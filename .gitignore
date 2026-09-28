@@ -17,5 +17,6 @@ build/**
 *log
 cuda-oversubscribed-benchmarks-main/**
 pagelog_test_results/**
+*_results/**
 results/**
 __pycache__/

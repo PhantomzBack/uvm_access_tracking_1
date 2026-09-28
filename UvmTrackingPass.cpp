@@ -7,7 +7,7 @@
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/IR/Constants.h"
-#include <llvm-20/llvm/Support/raw_ostream.h>
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #include <set>
 
@@ -159,26 +159,52 @@ bool isPageAlignedStride(const llvm::SCEV *StrideSCEV) {
 }
 
 
+static llvm::GlobalVariable *getTrackingEnabledGlobal(llvm::Module &M) {
+    auto *I32Ty = llvm::Type::getInt32Ty(M.getContext());
+    // In NVPTX, address space 4 is __constant__ memory
+    auto *GV = M.getGlobalVariable("g_tracking_enabled", true);
+    if (!GV) {
+        GV = new llvm::GlobalVariable(
+            M, I32Ty, false, llvm::GlobalValue::ExternalLinkage,
+            nullptr, "g_tracking_enabled", nullptr,
+            llvm::GlobalValue::NotThreadLocal, 4);
+    }
+    return GV;
+}
+
+static llvm::Value *emitTrackingEnabledCheck(llvm::IRBuilder<> &B, llvm::Module &M) {
+    auto &Ctx = M.getContext();
+    auto *I32Ty = llvm::Type::getInt32Ty(Ctx);
+    auto *GV = getTrackingEnabledGlobal(M);
+    llvm::Value *EnabledVal = B.CreateLoad(I32Ty, GV, "uvm.tracking_enabled");
+    return B.CreateICmpNE(EnabledVal, llvm::ConstantInt::get(I32Ty, 0), "uvm.is_enabled");
+}
+
 void hoistMarkPage(llvm::Value *Ptr, llvm::Loop *L,
-                   llvm::Function *MarkPageFn) {
+                   llvm::Function *MarkPageFn,
+                   llvm::Module &M) {
     // Get the preheader — the block that jumps into the loop
     llvm::BasicBlock *Preheader = L->getLoopPreheader();
     if (!Preheader) return; // can't hoist without a single preheader
 
-    // Insert before the preheader's terminator (the branch into the loop)
     llvm::IRBuilder<> B(Preheader->getTerminator());
+    llvm::Value *IsEnabled = emitTrackingEnabledCheck(B, M);
+
+    llvm::Instruction *ThenTerm = llvm::SplitBlockAndInsertIfThen(IsEnabled, Preheader->getTerminator(), false);
+    llvm::IRBuilder<> TB(ThenTerm);
 
     // Cast ptr to i64
     auto *I64Ty  = llvm::Type::getInt64Ty(Preheader->getContext());
-    auto *PtrInt = B.CreatePtrToInt(Ptr, I64Ty, "ptr.int");
+    auto *PtrInt = TB.CreatePtrToInt(Ptr, I64Ty, "ptr.int");
 
     // Call MarkAccess with the full address
-    B.CreateCall(MarkPageFn, {PtrInt});
+    TB.CreateCall(MarkPageFn, {PtrInt});
 }
 
 void hoistMarkPageConditional(llvm::Value *Ptr, llvm::Loop *L,
                                uint64_t ByteRange,
-                               llvm::Function *MarkPageFn) {
+                               llvm::Function *MarkPageFn,
+                               llvm::Module &M) {
     llvm::BasicBlock *Preheader = L->getLoopPreheader();
     if (!Preheader) return;
 
@@ -188,6 +214,7 @@ void hoistMarkPageConditional(llvm::Value *Ptr, llvm::Loop *L,
 
     // ── 1. Emit the runtime check at end of preheader ──
     llvm::IRBuilder<> B(Preheader->getTerminator());
+    llvm::Value *IsEnabled = emitTrackingEnabledCheck(B, M);
 
     llvm::Value *PtrInt  = B.CreatePtrToInt(Ptr, I64Ty);
     llvm::Value *PageOff = B.CreateAnd(PtrInt,
@@ -199,6 +226,7 @@ void hoistMarkPageConditional(llvm::Value *Ptr, llvm::Loop *L,
     llvm::Value *Fits    = B.CreateICmpULT(EndOff,
                                llvm::ConstantInt::get(I64Ty, PAGE_SIZE),
                                "page.fits");
+    llvm::Value *ShouldHoist = B.CreateAnd(IsEnabled, Fits, "page.should_hoist");
 
     // ── 2. Create a hoist block that runs mark_page once ──
     llvm::BasicBlock *HoistBB = llvm::BasicBlock::Create(Ctx, "mark.hoist", F,
@@ -211,14 +239,15 @@ void hoistMarkPageConditional(llvm::Value *Ptr, llvm::Loop *L,
     // ── 3. Replace preheader's unconditional branch with a conditional one ──
     Preheader->getTerminator()->eraseFromParent();
     llvm::IRBuilder<> PB(Preheader);
-    PB.CreateCondBr(Fits, HoistBB, L->getHeader());
-    //               ↑ fits → hoist block (mark once)
-    //                         ↑ doesn't fit → go straight to loop (mark per-iter)
+    PB.CreateCondBr(ShouldHoist, HoistBB, L->getHeader());
+    //               ↑ should hoist → hoist block (mark once)
+    //                         ↑ doesn't fit or disabled → go straight to loop
 }
 
 void hoistBatchMarkPages(llvm::Value *Ptr, llvm::Loop *L,
                           const PageInvarianceResult &Result,
-                          llvm::Function *MarkPageFn) {
+                          llvm::Function *MarkPageFn,
+                          llvm::Module &M) {
     if (Result.tripCount == 0) return; // need a known TC for batch marking
     llvm::BasicBlock *Preheader = L->getLoopPreheader();
     if (!Preheader) return;
@@ -227,23 +256,27 @@ void hoistBatchMarkPages(llvm::Value *Ptr, llvm::Loop *L,
     auto *I64Ty = llvm::Type::getInt64Ty(Ctx);
 
     llvm::IRBuilder<> B(Preheader->getTerminator());
+    llvm::Value *IsEnabled = emitTrackingEnabledCheck(B, M);
+
+    llvm::Instruction *ThenTerm = llvm::SplitBlockAndInsertIfThen(IsEnabled, Preheader->getTerminator(), false);
+    llvm::IRBuilder<> TB(ThenTerm);
 
     // base_page = ptr >> PAGE_SHIFT
-    llvm::Value *PtrInt  = B.CreatePtrToInt(Ptr, I64Ty);
-    llvm::Value *BasePage = B.CreateLShr(PtrInt,
+    llvm::Value *PtrInt  = TB.CreatePtrToInt(Ptr, I64Ty);
+    llvm::Value *BasePage = TB.CreateLShr(PtrInt,
                                 llvm::ConstantInt::get(I64Ty, PAGE_SHIFT),
                                 "base.page");
 
     // Emit one mark_page call per page touched
     // (safe to unroll here since TC is known and typically small for GPU kernels)
     for (uint64_t i = 0; i < Result.tripCount; i++) {
-        llvm::Value *PageNo = B.CreateAdd(BasePage,
+        llvm::Value *PageNo = TB.CreateAdd(BasePage,
                                   llvm::ConstantInt::get(I64Ty, i),
                                   "page.no." + std::to_string(i));
-        llvm::Value *Addr = B.CreateShl(PageNo,
-                               llvm::ConstantInt::get(I64Ty, PAGE_SHIFT),
-                               "page.addr." + std::to_string(i));
-        B.CreateCall(MarkPageFn, {Addr});
+        llvm::Value *Addr = TB.CreateShl(PageNo,
+                                llvm::ConstantInt::get(I64Ty, PAGE_SHIFT),
+                                "page.addr." + std::to_string(i));
+        TB.CreateCall(MarkPageFn, {Addr});
     }
 }
 
@@ -402,16 +435,21 @@ static bool emitBatchMarkAccess(
                    << L->getLoopDepth() << " → "
                    << HoistTarget->getLoopDepth() << "\n";
 
+    // ── Guard by g_tracking_enabled check in preheader ───────────────────────
+    llvm::IRBuilder<> GuardB(HoistPreheader->getTerminator());
+    llvm::Value *IsEnabled = emitTrackingEnabledCheck(GuardB, *HoistPreheader->getModule());
+    llvm::Instruction *ThenTerm = llvm::SplitBlockAndInsertIfThen(IsEnabled, HoistPreheader->getTerminator(), false);
+
     // ── Expand SCEVs and emit runtime count (if needed) ───────────────────────
     llvm::SCEVExpander Expander(SE, DL, "batch.mark");
-    auto InsertIt = HoistPreheader->getTerminator()->getIterator();
+    auto InsertIt = ThenTerm->getIterator();
 
     llvm::Value *BasePtr   = Expander.expandCodeFor(BaseSCEV,   PtrTy,  InsertIt);
     llvm::Value *StrideVal = Expander.expandCodeFor(StrideSCEV, I64Ty,  InsertIt);
     llvm::Value *CountVal;
 
     if (needRuntimeCount) {
-        llvm::IRBuilder<> RB(HoistPreheader->getTerminator());
+        llvm::IRBuilder<> RB(ThenTerm);
         llvm::Value *StartV = Expander.expandCodeFor(IVStartSCEV, I64Ty, InsertIt);
         llvm::Value *StepV  = Expander.expandCodeFor(IVStepSCEV,  I64Ty, InsertIt);
         llvm::Value *BoundV = RB.CreateZExtOrTrunc(BoundValIR, I64Ty, "bound.i64");
@@ -437,7 +475,7 @@ static bool emitBatchMarkAccess(
         CountVal = Expander.expandCodeFor(CountSCEV, I64Ty, InsertIt);
     }
 
-    llvm::IRBuilder<> B(HoistPreheader->getTerminator());
+    llvm::IRBuilder<> B(ThenTerm);
     llvm::Value *BaseInt = B.CreatePtrToInt(BasePtr, I64Ty, "batch.base");
     B.CreateCall(BatchMarkFn, {BaseInt, StrideVal, CountVal});
     return true;
@@ -467,7 +505,8 @@ llvm::Value *emitPageInvarianceRuntimeCheck(
 
     void processMemoryOp(llvm::Instruction &I, llvm::Loop *L,
                         llvm::ScalarEvolution &SE,
-                        llvm::LoopInfo &LI) {
+                        llvm::LoopInfo &LI,
+                        llvm::Function *MarkFn) {
         llvm::Value *Ptr = nullptr;
         if (auto *Load  = llvm::dyn_cast<llvm::LoadInst>(&I))  Ptr = Load->getPointerOperand();
         if (auto *Store = llvm::dyn_cast<llvm::StoreInst>(&I)) Ptr = Store->getPointerOperand();
@@ -479,19 +518,20 @@ llvm::Value *emitPageInvarianceRuntimeCheck(
         if (AS != 0 && AS != 1) return;
 
         auto Result = checkPageInvariance(Ptr, L, SE);
+        llvm::Module &M = *I.getModule();
 
         switch (Result.kind) {
         case PageInvariance::Invariant:
             // Safe to hoist mark_page() to preheader unconditionally
             UVM_DBGS() << "[UVM] Page-invariant (address invariant): " << *Ptr << "\n";
-            hoistMarkPage(Ptr, L, MarkFuncPtr);
+            hoistMarkPage(Ptr, L, MarkFn, M);
             break;
 
         case PageInvariance::MaybeInvariant:
             // Hoist behind runtime check
             UVM_DBGS() << "[UVM] Maybe page-invariant: range="
                        << Result.byteRange << " bytes\n";
-            hoistMarkPageConditional(Ptr, L, Result.byteRange, MarkFuncPtr);
+            hoistMarkPageConditional(Ptr, L, Result.byteRange, MarkFn, M);
             break;
 
         case PageInvariance::Variant:
@@ -502,7 +542,7 @@ llvm::Value *emitPageInvarianceRuntimeCheck(
             // Bonus: if stride == PAGE_SIZE, you can compute accessed pages
             // statically and batch-mark them in the preheader
             if (isPageAlignedStride(Result.stride))
-                hoistBatchMarkPages(Ptr, L, Result, MarkFuncPtr);
+                hoistBatchMarkPages(Ptr, L, Result, MarkFn, M);
             break;
 
         case PageInvariance::Unknown:
@@ -621,14 +661,14 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
                     }
                     UVM_DBGS() << "[UVM] Page-invariant: " << *Ptr << "\n";
 
-                    hoistMarkPage(Ptr, L, cast<Function>(MarkFunc.getCallee()));
+                    hoistMarkPage(Ptr, L, cast<Function>(MarkFunc.getCallee()), M);
                     continue; // skip per-instruction instrumentation below
                 }
                 if (Result.kind == PageInvariance::MaybeInvariant) {
                     UVM_DBGS() << "[UVM] Maybe page-invariant: range="
                                << Result.byteRange << " bytes\n";
                     hoistMarkPageConditional(Ptr, L, Result.byteRange,
-                                            cast<Function>(MarkFunc.getCallee()));
+                                            cast<Function>(MarkFunc.getCallee()), M);
                     continue;
                 }
                 if (Result.kind == PageInvariance::Variant && Result.stride) {
@@ -645,22 +685,27 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
             }
 
 
-                    // fallback: per-instruction instrumentation
+            // fallback: per-instruction instrumentation
             AllocaInst *LocalCacheVar = AllocaBuilder.CreateAlloca(
                 Type::getInt64Ty(Ctx), nullptr, "last_page_local");
             AllocaBuilder.CreateStore(
                 ConstantInt::get(Type::getInt64Ty(Ctx), ~0ULL), LocalCacheVar);
 
             IRBuilder<> Builder(Inst);
-            Value *AddrInt  = Builder.CreatePtrToInt(Ptr, Builder.getInt64Ty());
-            Value *CurPage  = Builder.CreateLShr(AddrInt, 12);
-            Value *LastPage = Builder.CreateLoad(Builder.getInt64Ty(), LocalCacheVar);
-            Value *IsNewPage = Builder.CreateICmpNE(CurPage, LastPage);
+            Value *IsEnabled = emitTrackingEnabledCheck(Builder, M);
 
-            Instruction *ThenTerm = SplitBlockAndInsertIfThen(IsNewPage, Inst, false);
-            Builder.SetInsertPoint(ThenTerm);
-            Builder.CreateCall(MarkFunc, {AddrInt});
-            Builder.CreateStore(CurPage, LocalCacheVar);
+            Instruction *ThenTerm = SplitBlockAndInsertIfThen(IsEnabled, Inst, false);
+            IRBuilder<> ThenBuilder(ThenTerm);
+
+            Value *AddrInt  = ThenBuilder.CreatePtrToInt(Ptr, ThenBuilder.getInt64Ty());
+            Value *CurPage  = ThenBuilder.CreateLShr(AddrInt, 12);
+            Value *LastPage = ThenBuilder.CreateLoad(ThenBuilder.getInt64Ty(), LocalCacheVar);
+            Value *IsNewPage = ThenBuilder.CreateICmpNE(CurPage, LastPage);
+
+            Instruction *InnerThenTerm = SplitBlockAndInsertIfThen(IsNewPage, ThenTerm, false);
+            IRBuilder<> InnerBuilder(InnerThenTerm);
+            InnerBuilder.CreateCall(MarkFunc, {AddrInt});
+            InnerBuilder.CreateStore(CurPage, LocalCacheVar);
 
             Changed = true;
             UVM_DBGS() << "   [+] Instrumented: " << *Inst << "\n";

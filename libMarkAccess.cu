@@ -354,7 +354,8 @@ void init_tracking(void**** d_l1_ptr)
     CUDA_CHECK(cudaMemcpyToSymbol(shadow_l1, &temp, sizeof(void***)));
 
     // Set runtime toggle defaults based on compile-time mode
-    int enabled = 1;
+    const char* env_dis = getenv("UVM_TRACKING_DISABLED");
+    int enabled = (env_dis && env_dis[0] == '1') ? 0 : 1;
     int skip    = (UVM_TRACKING_MODE == 2) ? 1 : 0;
     CUDA_CHECK(cudaMemcpyToSymbol(g_tracking_enabled, &enabled, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(g_skip_on_miss,     &skip,    sizeof(int)));
