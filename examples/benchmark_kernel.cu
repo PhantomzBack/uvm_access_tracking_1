@@ -91,6 +91,9 @@ int main(int argc, char** argv) {
     dim3 block(256);
     dim3 grid(256); 
 
+    int num_iters = (argc >= 3) ? atoi(argv[2]) : 50;
+    if (num_iters < 1) num_iters = 1;
+
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
@@ -98,25 +101,36 @@ int main(int argc, char** argv) {
     // Warmup & Select Kernel
     auto launch_kernel = [&](int id) {
         switch(id) {
-            case 0: printf("Selected coalesced");test_coalesced<<<grid, block>>>(d_in, n); break;
-            case 1: printf("Selected stride");test_stride<<<grid, block>>>(d_in, n, 32); break;
-            case 2: printf("Selected random");test_random<<<grid, block>>>(d_in, d_indices, n); break;
-            case 3: printf("Selected stencil");test_stencil<<<grid, block>>>(d_in, d_out, n); break;
-            case 4: printf("Selected atomic");test_atomic<<<grid, block>>>(d_out, n); break;
+            case 0: test_coalesced<<<grid, block>>>(d_in, n); break;
+            case 1: test_stride<<<grid, block>>>(d_in, n, 32); break;
+            case 2: test_random<<<grid, block>>>(d_in, d_indices, n); break;
+            case 3: test_stencil<<<grid, block>>>(d_in, d_out, n); break;
+            case 4: test_atomic<<<grid, block>>>(d_out, n); break;
         }
     };
+
+    switch(test_id) {
+        case 0: printf("Selected coalesced\n"); break;
+        case 1: printf("Selected stride\n"); break;
+        case 2: printf("Selected random\n"); break;
+        case 3: printf("Selected stencil\n"); break;
+        case 4: printf("Selected atomic\n"); break;
+    }
 
     launch_kernel(test_id); // Warmup
     cudaDeviceSynchronize();
 
     cudaEventRecord(start);
-    launch_kernel(test_id); // Timed run
+    for (int it = 0; it < num_iters; ++it) {
+        launch_kernel(test_id); // Timed run
+    }
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
 
     float ms = 0;
     cudaEventElapsedTime(&ms, start, stop);
-    std::cout << "BENCHMARK_TIME: " << ms << " ms" << std::endl;
+    float avg_ms = ms / num_iters;
+    std::cout << "BENCHMARK_TIME: " << avg_ms << " ms" << std::endl;
 #ifdef TRACKING_ENABLED
     export_binary(d_l1, "access_log.bin");
     cudaFree(d_l1);

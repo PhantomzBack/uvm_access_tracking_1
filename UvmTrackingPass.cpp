@@ -9,6 +9,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include <set>
 
 #ifdef UVM_DEBUG
@@ -553,6 +554,38 @@ llvm::Value *emitPageInvarianceRuntimeCheck(
 
 using namespace llvm;
 
+static bool isNvvmKernel(const Function &F) {
+    if (F.getCallingConv() == CallingConv::PTX_Kernel)
+        return true;
+    const Module *M = F.getParent();
+    if (!M) return false;
+    const NamedMDNode *MD = M->getNamedMetadata("nvvm.annotations");
+    if (!MD) return false;
+    for (unsigned i = 0; i < MD->getNumOperands(); ++i) {
+        const MDNode *N = MD->getOperand(i);
+        if (N->getNumOperands() >= 3) {
+            auto *VMD = dyn_cast<ValueAsMetadata>(N->getOperand(0));
+            if (VMD && VMD->getValue() == &F) {
+                auto *Prop = dyn_cast<MDString>(N->getOperand(1));
+                if (Prop && Prop->getString() == "kernel")
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool isRuntimeFunction(const Function &F) {
+    StringRef Name = F.getName();
+    if (Name.contains("MarkAccess") || Name.contains("BatchMarkAccess")) return true;
+    if (Name.contains("copy_l2_to_host") || Name.contains("copy_l3_to_host")) return true;
+    if (Name.contains("uvm_clear_l3s_kernel")) return true;
+    if (Name.contains("init_tracking") || Name.contains("export_log") || Name.contains("export_binary")) return true;
+    if (Name.starts_with("llvm.") || Name.starts_with("__cuda_sm70_") || Name.starts_with("nvvm.")) return true;
+    if (Name == "malloc" || Name == "free" || Name == "memset" || Name == "memcpy") return true;
+    return false;
+}
+
 class UvmTrackingPass : public PassInfoMixin<UvmTrackingPass> {
 public:
 
@@ -578,12 +611,91 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
 
     bool Changed = false;
 
+    // 1. Identify all user functions (kernels + device functions) to clone
+    std::vector<Function*> UserFunctions;
     for (Function &F : M) {
         if (!F.hasFnAttribute("target-features")) continue;
         if (!F.getFnAttribute("target-features").getValueAsString().contains("ptx")) continue;
-        if (F.isDeclaration() || F.getName().contains("MarkAccess")) continue;
+        if (F.isDeclaration() || isRuntimeFunction(F)) continue;
+        if (F.getName().starts_with("__uvm_tracked_")) continue;
+        UserFunctions.push_back(&F);
+    }
 
-        UVM_DBGS() << "[UvmPass] Processing function: " << F.getName() << "\n";
+    if (UserFunctions.empty()) {
+        UVM_DBGS() << "[UvmPass] No user GPU functions found in module: " << M.getSourceFileName() << "\n";
+        return PreservedAnalyses::all();
+    }
+
+    // 2. Clone each user function F -> __uvm_tracked_F
+    DenseMap<Function*, Function*> FunctionMap;
+    std::vector<Function*> TrackedFunctions;
+
+    for (Function *OrigF : UserFunctions) {
+        ValueToValueMapTy VMap;
+        Function *TrackedF = CloneFunction(OrigF, VMap);
+        TrackedF->setName("__uvm_tracked_" + OrigF->getName());
+
+        if (isNvvmKernel(*OrigF)) {
+            TrackedF->setLinkage(GlobalValue::ExternalLinkage);
+            TrackedF->setVisibility(GlobalValue::DefaultVisibility);
+        } else {
+            TrackedF->setLinkage(OrigF->getLinkage());
+            TrackedF->setVisibility(OrigF->getVisibility());
+        }
+
+        FunctionMap[OrigF] = TrackedF;
+        TrackedFunctions.push_back(TrackedF);
+        Changed = true;
+        UVM_DBGS() << "[UvmPass] Cloned function " << OrigF->getName()
+                   << " -> " << TrackedF->getName() << "\n";
+    }
+
+    // 3. Remap all call sites inside TrackedFunctions to call tracked callees
+    for (Function *TrackedF : TrackedFunctions) {
+        for (BasicBlock &BB : *TrackedF) {
+            for (Instruction &Inst : BB) {
+                if (auto *CB = dyn_cast<CallBase>(&Inst)) {
+                    if (Function *Callee = CB->getCalledFunction()) {
+                        auto it = FunctionMap.find(Callee);
+                        if (it != FunctionMap.end()) {
+                            CB->setCalledFunction(it->second);
+                            UVM_DBGS() << "[UvmPass] Remapped call in " << TrackedF->getName()
+                                       << " to " << it->second->getName() << "\n";
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Duplicate nvvm.annotations metadata entries for all __global__ kernels
+    NamedMDNode *NVVMMD = M.getOrInsertNamedMetadata("nvvm.annotations");
+    unsigned numOperands = NVVMMD->getNumOperands();
+    for (unsigned i = 0; i < numOperands; ++i) {
+        MDNode *N = NVVMMD->getOperand(i);
+        if (N->getNumOperands() >= 1) {
+            auto *VMD = dyn_cast<ValueAsMetadata>(N->getOperand(0));
+            if (VMD) {
+                if (auto *OrigF = dyn_cast<Function>(VMD->getValue())) {
+                    auto it = FunctionMap.find(OrigF);
+                    if (it != FunctionMap.end() && isNvvmKernel(*OrigF)) {
+                        Function *TrackedF = it->second;
+                        SmallVector<Metadata*, 4> Ops;
+                        Ops.push_back(ValueAsMetadata::get(TrackedF));
+                        for (unsigned j = 1; j < N->getNumOperands(); ++j) {
+                            Ops.push_back(N->getOperand(j));
+                        }
+                        NVVMMD->addOperand(MDNode::get(Ctx, Ops));
+                    }
+                }
+            }
+        }
+    }
+
+    // 5. Instrument ONLY the cloned functions (TrackedFunctions)
+    for (Function *FPtr : TrackedFunctions) {
+        Function &F = *FPtr;
+        UVM_DBGS() << "[UvmPass] Processing tracked function: " << F.getName() << "\n";
 
         // ── Now you can use function-level analyses ──
         auto &LI = FAM.getResult<LoopAnalysis>(F);

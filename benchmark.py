@@ -33,43 +33,32 @@ BASE_FLAGS = [
 # ── Benchmark definitions ─────────────────────────────────────────────────────
 # Each entry: (display_name, source_file, kernel_id, expected_pass_strategy)
 BENCHMARKS = [
-    # Original suite
-    ("Coalesced",  "examples/benchmark_kernel.cu",  ["0"], "BatchMarkAccess (runtime count)"),
-    ("Stride",     "examples/benchmark_kernel.cu",  ["1"], "BatchMarkAccess (runtime count)"),
-    ("Random",     "examples/benchmark_kernel.cu",  ["2"], "Fallback (non-affine index)"),
-    ("Stencil",    "examples/benchmark_kernel.cu",  ["3"], "BatchMarkAccess x3 (runtime count)"),
-    ("Atomic",     "examples/benchmark_kernel.cu",  ["4"], "Hoisted (loop-invariant ptr)"),
-    # Extended suite
-    ("SAXPY",      "examples/benchmark_extended.cu", ["0"], "BatchMarkAccess x2 (runtime count)"),
-    ("Reduction",  "examples/benchmark_extended.cu", ["1"], "BatchMarkAccess + Hoisted"),
-    ("Histogram",  "examples/benchmark_extended.cu", ["2"], "BatchMarkAccess + Fallback (scatter)"),
-    ("Transpose",  "examples/benchmark_extended.cu", ["3"], "Fallback (no loop / shared mem)"),
-    ("GEMV",       "examples/benchmark_extended.cu", ["4"], "BatchMarkAccess (nested loops)"),
+    # Original suite (with 50 inner-iteration loop averaging)
+    ("Coalesced",     "examples/benchmark_kernel.cu",   ["0", "50"], "BatchMarkAccess (runtime count)"),
+    ("Stride",        "examples/benchmark_kernel.cu",   ["1", "50"], "BatchMarkAccess (runtime count)"),
+    ("Random",        "examples/benchmark_kernel.cu",   ["2", "50"], "Fallback (non-affine index)"),
+    ("Stencil",       "examples/benchmark_kernel.cu",   ["3", "50"], "BatchMarkAccess x3 (runtime count)"),
+    ("Atomic",        "examples/benchmark_kernel.cu",   ["4", "50"], "Hoisted (loop-invariant ptr)"),
+    # Extended suite (with 50 inner-iteration loop averaging)
+    ("SAXPY",         "examples/benchmark_extended.cu", ["0", "50"], "BatchMarkAccess x2 (runtime count)"),
+    ("Reduction",     "examples/benchmark_extended.cu", ["1", "50"], "BatchMarkAccess + Hoisted"),
+    ("Histogram",     "examples/benchmark_extended.cu", ["2", "50"], "BatchMarkAccess + Fallback (scatter)"),
+    ("Transpose",     "examples/benchmark_extended.cu", ["3", "50"], "Fallback (no loop / shared mem)"),
+    ("GEMV",          "examples/benchmark_extended.cu", ["4", "50"], "BatchMarkAccess (nested loops)"),
     # Real-world: tiled GEMM from CUDA Samples
-    ("MatrixMul",  "examples/matrixMul.cu",          [], "BatchMarkAccess (tiled A,B; SLE loop)"),
-    # ("matrixMul", "examples/matrixMul.cu", "", "Testcase Description"),
-    # ("2DConvolution", "examples/2DCONV/2DConvolution.cu", ["-mb", "5000"], "Testcase Description"),
-    # ("2mm", "examples/2MM/2mm.cu", ["-mb", "200"], "Testcase Description"),
-    # ("3DConvolution", "examples/3DCONV/3DConvolution.cu", ["-mb", "6000"], "Testcase Description"),
-    # ("atax", "examples/ATAX/atax.cu", ["-mb", "6000"], "Testcase Description"),
-    # ("bicg", "examples/BICG/bicg.cu", ["-mb", "5000"], "Testcase Description"),
-    # ("covariance", "examples/COVAR/covariance.cu", [], "Testcase Description"),
-    # ("fdtd2d", "examples/FDTD-2D/fdtd2d.cu", ["-mb", "2000"], "Testcase Description"),
-    # ("gramschmidt", "examples/GRAMSCHM/gramschmidt.cu", [], "Testcase Description"),
-    # ("needle", "examples/nw/needle.cu", ["-mb", "5600"], "Testcase Description"),
-    # ("syr2k", "examples/SYR2K/syr2k.cu", [], "Testcase Description"),
-    # ("syrk", "examples/SYRK/syrk.cu", [], "Testcase Description"),
-    ("2DConvolution", "examples/2DCONV/2DConvolution.cu", [], "Testcase Description"),
-    ("2mm", "examples/2MM/2mm.cu", [], "Testcase Description"),
-    ("3DConvolution", "examples/3DCONV/3DConvolution.cu", [], "Testcase Description"),
-    ("atax", "examples/ATAX/atax.cu", [], "Testcase Description"),
-    ("bicg", "examples/BICG/bicg.cu", [], "Testcase Description"),
-    ("covariance", "examples/COVAR/covariance.cu", ["50000000"], "Testcase Description"),
-    ("fdtd2d", "examples/FDTD-2D/fdtd2d.cu", ["-mb", "1000"], "Testcase Description"),
-    ("gramschmidt", "examples/GRAMSCHM/gramschmidt.cu", [], "Testcase Description"),
-    ("needle", "examples/nw/needle.cu", ["-mb", "2000"], "Testcase Description"),
-    ("syr2k", "examples/SYR2K/syr2k.cu", [], "Testcase Description"),
-    ("syrk", "examples/SYRK/syrk.cu", [], "Testcase Description"),
+    ("MatrixMul",     "examples/matrixMul.cu",          [], "BatchMarkAccess (tiled A,B; SLE loop)"),
+    # Scaled Polybench Workloads
+    ("2DConvolution", "examples/2DCONV/2DConvolution.cu", ["-mb", "200"], "Testcase Description"),
+    ("2mm",           "examples/2MM/2mm.cu",            ["-mb", "200"], "Testcase Description"),
+    ("3DConvolution", "examples/3DCONV/3DConvolution.cu", ["-mb", "200"], "Testcase Description"),
+    ("atax",          "examples/ATAX/atax.cu",          ["-mb", "200"], "Testcase Description"),
+    ("bicg",          "examples/BICG/bicg.cu",          ["-mb", "200"], "Testcase Description"),
+    ("covariance",    "examples/COVAR/covariance.cu",   ["50000000"],   "Testcase Description"),
+    ("fdtd2d",        "examples/FDTD-2D/fdtd2d.cu",     ["-mb", "500"], "Testcase Description"),
+    ("gramschmidt",   "examples/GRAMSCHM/gramschmidt.cu", ["-mb", "200"], "Testcase Description"),
+    ("needle",        "examples/nw/needle.cu",          ["-mb", "2000"], "Testcase Description"),
+    ("syr2k",         "examples/SYR2K/syr2k.cu",        ["-mb", "200"], "Testcase Description"),
+    ("syrk",          "examples/SYRK/syrk.cu",          ["-mb", "200"], "Testcase Description"),
 ]
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

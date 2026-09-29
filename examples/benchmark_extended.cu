@@ -140,6 +140,9 @@ int main(int argc, char** argv) {
     dim3 block_2d(TILE, TILE);
     dim3 grid_2d((MAT + TILE - 1) / TILE, (MAT + TILE - 1) / TILE);
 
+    int num_iters = (argc >= 3) ? atoi(argv[2]) : 50;
+    if (num_iters < 1) num_iters = 1;
+
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
@@ -147,39 +150,45 @@ int main(int argc, char** argv) {
     auto launch = [&](int id) {
         switch (id) {
             case 0:
-                printf("Selected saxpy");
                 test_saxpy<<<grid_1d, block_1d>>>(d_x, d_y, 2.5f, N);
                 break;
             case 1:
-                printf("Selected reduction");
                 test_reduction<<<grid_1d, block_1d, block_1d.x * sizeof(int)>>>(d_data, d_result, N);
                 break;
             case 2:
-                printf("Selected histogram");
                 test_histogram<<<grid_1d, block_1d>>>(d_data, d_hist, N, 256);
                 break;
             case 3:
-                printf("Selected transpose");
                 test_transpose<<<grid_2d, block_2d>>>(d_ti, d_to, MAT);
                 break;
             case 4:
-                printf("Selected gemv");
                 test_gemv<<<grid_1d, block_1d>>>(d_A, d_gx, d_gy, MAT, MAT);
                 break;
         }
     };
 
+    switch (test_id) {
+        case 0: printf("Selected saxpy\n"); break;
+        case 1: printf("Selected reduction\n"); break;
+        case 2: printf("Selected histogram\n"); break;
+        case 3: printf("Selected transpose\n"); break;
+        case 4: printf("Selected gemv\n"); break;
+    }
+
     launch(test_id);  // warmup
     cudaDeviceSynchronize();
 
     cudaEventRecord(start);
-    launch(test_id);  // timed
+    for (int it = 0; it < num_iters; ++it) {
+        launch(test_id);  // timed
+    }
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
 
     float ms = 0;
     cudaEventElapsedTime(&ms, start, stop);
-    printf("\nBENCHMARK_TIME: %.3f ms\n", ms);
+    float avg_ms = ms / num_iters;
+    printf("\nBENCHMARK_TIME: %.3f ms\n", avg_ms);
 
 #ifdef TRACKING_ENABLED
     export_binary(d_l1, "access_log.bin");

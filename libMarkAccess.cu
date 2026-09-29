@@ -35,6 +35,7 @@ __device__ inline unsigned int my_match_any_sync(unsigned int mask, int value) {
 
 // ── Host-accessible globals for LD_PRELOAD wrapper ────────────────────────────
 extern "C" void** g_uvm_shadow_l1 = nullptr;
+extern "C" int    g_uvm_tracking_enabled_host = 1;
 
 // ── Device globals ────────────────────────────────────────────────────────────
 extern "C" {
@@ -356,6 +357,7 @@ void init_tracking(void**** d_l1_ptr)
     // Set runtime toggle defaults based on compile-time mode
     const char* env_dis = getenv("UVM_TRACKING_DISABLED");
     int enabled = (env_dis && env_dis[0] == '1') ? 0 : 1;
+    g_uvm_tracking_enabled_host = enabled;
     int skip    = (UVM_TRACKING_MODE == 2) ? 1 : 0;
     CUDA_CHECK(cudaMemcpyToSymbol(g_tracking_enabled, &enabled, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(g_skip_on_miss,     &skip,    sizeof(int)));
@@ -578,6 +580,7 @@ extern "C" void uvm_tracking_drop_range(uintptr_t start, size_t len)
 extern "C" void uvm_tracking_set_enabled(int v)
 {
     int val = v ? 1 : 0;
+    g_uvm_tracking_enabled_host = val;
     CUDA_CHECK(cudaMemcpyToSymbol(g_tracking_enabled, &val, sizeof(int)));
 }
 
