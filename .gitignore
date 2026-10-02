@@ -9,6 +9,7 @@
 *.dll
 *.fatbin
 *.ptx
+*.bin
 *cscope*
 *tags*
 build/**

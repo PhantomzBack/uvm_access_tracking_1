@@ -332,6 +332,36 @@ extern "C" {
             LOG("[copy_l3_to_host] successful\n");
 
     }
+
+    __global__ void uvm_mark_predicted_range_kernel(uintptr_t start_addr, uint64_t num_pages)
+    {
+        uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+        if (tid >= num_pages) return;
+
+        uintptr_t addr = start_addr + (tid << 12);
+        uint32_t cached_l1 = (uint32_t)-1;
+        uint32_t cached_l2 = (uint32_t)-1;
+        void** l2_table = nullptr;
+        unsigned long long* l3_bitmap = nullptr;
+        mark_single_page(addr, cached_l1, cached_l2, l2_table, l3_bitmap);
+    }
+}
+
+// ── Host API: mark a predicted range on GPU stream ────────────────────────────
+extern "C" void uvm_mark_predicted_range(uintptr_t start, size_t size, void* stream)
+{
+    if (!g_uvm_shadow_l1 || !start || size == 0) return;
+    uintptr_t start_page = start >> 12;
+    uintptr_t end_page = (start + size - 1) >> 12;
+    uint64_t num_pages = (end_page >= start_page) ? (end_page - start_page + 1) : 0;
+    if (num_pages == 0) return;
+
+    int threads = 256;
+    unsigned int blocks = (unsigned int)((num_pages + threads - 1) / threads);
+    dim3 grid(blocks);
+    dim3 block(threads);
+    cudaStream_t s = (cudaStream_t)stream;
+    uvm_mark_predicted_range_kernel<<<grid, block, 0, s>>>(start_page << 12, num_pages);
 }
 
 
