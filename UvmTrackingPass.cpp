@@ -11,6 +11,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/IR/InlineAsm.h"
 #include "include/uvm_policy.h"
 #include <set>
 #include <fstream>
@@ -1077,11 +1078,41 @@ static void emitModuleMetadataTable(
     }
 }
 
+static Value *getMemoryAccessPointer(Instruction *Inst) {
+    if (auto *LI = dyn_cast<LoadInst>(Inst))  return LI->getPointerOperand();
+    if (auto *SI = dyn_cast<StoreInst>(Inst)) return SI->getPointerOperand();
+    if (auto *RMW = dyn_cast<AtomicRMWInst>(Inst)) return RMW->getPointerOperand();
+    if (auto *CX = dyn_cast<AtomicCmpXchgInst>(Inst)) return CX->getPointerOperand();
+    if (auto *CB = dyn_cast<CallBase>(Inst)) {
+        if (auto *IA = dyn_cast<InlineAsm>(CB->getCalledOperand())) {
+            StringRef AsmStr = IA->getAsmString();
+            if (AsmStr.contains("ld.global") || AsmStr.contains("st.global") ||
+                AsmStr.contains("atom.global") || AsmStr.contains("red.global")) {
+                for (Value *Arg : CB->args()) {
+                    if (Arg->getType()->isPointerTy()) {
+                        unsigned AS = trueAddressSpace(Arg);
+                        if (AS == 0 || AS == 1)
+                            return Arg;
+                    }
+                }
+            }
+        }
+    }
+    return nullptr;
+}
+
 class UvmTrackingPass : public PassInfoMixin<UvmTrackingPass> {
 public:
 
 PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
-    if (M.getTargetTriple().find("nvptx") == std::string::npos)
+    bool isNvptx = M.getTargetTriple().find("nvptx") != std::string::npos;
+    if (!isNvptx) {
+        if (M.getNamedMetadata("nvvm.annotations") ||
+            M.getDataLayoutStr().find("e-p3:32:32") != std::string::npos) {
+            isNvptx = true;
+        }
+    }
+    if (!isNvptx)
         return PreservedAnalyses::all();
     if (M.getSourceFileName().find("libMarkAccess") != std::string::npos)
         return PreservedAnalyses::all();
@@ -1105,10 +1136,14 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
     // 1. Identify all user functions (kernels + device functions) to clone
     std::vector<Function*> UserFunctions;
     for (Function &F : M) {
-        if (!F.hasFnAttribute("target-features")) continue;
-        if (!F.getFnAttribute("target-features").getValueAsString().contains("ptx")) continue;
         if (F.isDeclaration() || isRuntimeFunction(F)) continue;
         if (F.getName().starts_with("__uvm_tracked_")) continue;
+        bool isGpu = isNvvmKernel(F);
+        if (!isGpu && F.hasFnAttribute("target-features")) {
+            if (F.getFnAttribute("target-features").getValueAsString().contains("ptx"))
+                isGpu = true;
+        }
+        if (!isGpu) continue;
         UserFunctions.push_back(&F);
     }
 
@@ -1196,16 +1231,12 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
         std::vector<Instruction*> Targets;
         for (auto &BB : F) {
             for (auto &Inst : BB) {
-                Value *Ptr = nullptr;
-                if (auto *LI = dyn_cast<LoadInst>(&Inst))  Ptr = LI->getPointerOperand();
-                if (auto *SI = dyn_cast<StoreInst>(&Inst)) Ptr = SI->getPointerOperand();
-                if (auto *RMW = dyn_cast<AtomicRMWInst>(&Inst)) Ptr = RMW->getPointerOperand();
-                if (auto *CX = dyn_cast<AtomicCmpXchgInst>(&Inst)) Ptr = CX->getPointerOperand();
-
-                if (Ptr && Ptr->getType()->isPointerTy()) {
-                    unsigned AS = trueAddressSpace(Ptr);
-                    if (AS == 0 || AS == 1)
-                        Targets.push_back(&Inst);
+                if (Value *Ptr = getMemoryAccessPointer(&Inst)) {
+                    if (Ptr->getType()->isPointerTy()) {
+                        unsigned AS = trueAddressSpace(Ptr);
+                        if (AS == 0 || AS == 1)
+                            Targets.push_back(&Inst);
+                    }
                 }
             }
         }
@@ -1229,11 +1260,8 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
                 InstrumentedInBlock.clear();
             }
 
-            Value *Ptr = nullptr;
-            if (auto *LI = dyn_cast<LoadInst>(Inst))  Ptr = LI->getPointerOperand();
-            else if (auto *SI = dyn_cast<StoreInst>(Inst)) Ptr = SI->getPointerOperand();
-            else if (auto *RMW = dyn_cast<AtomicRMWInst>(Inst)) Ptr = RMW->getPointerOperand();
-            else if (auto *CX = dyn_cast<AtomicCmpXchgInst>(Inst)) Ptr = CX->getPointerOperand();
+            Value *Ptr = getMemoryAccessPointer(Inst);
+            if (!Ptr) continue;
 
             const SCEV *PtrSCEV = SE.getSCEV(Ptr);
             if (!InstrumentedInBlock.insert(PtrSCEV).second) {
@@ -1342,6 +1370,14 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginIn
             PB.registerOptimizerLastEPCallback(
                 [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase) {
                     MPM.addPass(UvmTrackingPass());
+                });
+            PB.registerPipelineParsingCallback(
+                [](StringRef Name, ModulePassManager &MPM, ArrayRef<PassBuilder::PipelineElement>) {
+                    if (Name == "uvm-tracking") {
+                        MPM.addPass(UvmTrackingPass());
+                        return true;
+                    }
+                    return false;
                 });
         }
     };
