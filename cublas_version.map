@@ -1,0 +1,5 @@
+libcublas.so.12 {
+    global:
+        cublasSgemm_v2;
+        cublasSgemm;
+};

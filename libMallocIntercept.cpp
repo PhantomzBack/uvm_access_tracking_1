@@ -174,308 +174,297 @@ static std::vector<ActiveAlloc>  g_active;
 static bool                    g_init_done = false;
 static thread_local bool       g_in_preload = false;
 
-// ── Built-in Predictors for Standard Benchmark Kernels ────────────────────────
+// ── Dynamic Bytecode Execution Engine ───────────────────────────────────────
+struct KernelBytecodePolicy {
+    std::string name;
+    uint16_t flags = 0;
+    uint16_t num_ranges = 0;
+    std::vector<uint8_t> bytecode;
+};
 
-// 1. test_coalesced(int* data, int n)
-static void pred_coalesced(void** args, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, std::vector<std::pair<uintptr_t, size_t>>& ranges) {
-    if (!args || !args[0] || !args[1]) return;
-    uintptr_t data = *(uintptr_t*)args[0];
-    int n = *(int*)args[1];
-    if (data && n > 0) ranges.push_back({data, (size_t)n * sizeof(int)});
-}
+static std::unordered_map<std::string, KernelBytecodePolicy> g_metadata_registry;
 
-// 2. test_stride(int* data, int n, int mem_stride)
-static void pred_stride(void** args, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, std::vector<std::pair<uintptr_t, size_t>>& ranges) {
-    if (!args || !args[0] || !args[1] || !args[2]) return;
-    uintptr_t data = *(uintptr_t*)args[0];
-    int n = *(int*)args[1];
-    int mem_stride = *(int*)args[2];
-    if (data && n > 0 && mem_stride > 0) ranges.push_back({data, (size_t)n * mem_stride * sizeof(int)});
-}
+static void load_metadata_cache() {
+    static bool loaded = false;
+    if (loaded) return;
+    loaded = true;
 
-// 3. test_stencil(int* in, int* out, int n)
-static void pred_stencil(void** args, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, std::vector<std::pair<uintptr_t, size_t>>& ranges) {
-    if (!args || !args[0] || !args[1] || !args[2]) return;
-    uintptr_t in = *(uintptr_t*)args[0];
-    uintptr_t out = *(uintptr_t*)args[1];
-    int n = *(int*)args[2];
-    if (in && n > 0) ranges.push_back({in, (size_t)n * sizeof(int)});
-    if (out && n > 0) ranges.push_back({out, (size_t)n * sizeof(int)});
-}
+    const char* paths[] = {".uvm_metadata.cache", "/tmp/.uvm_metadata.cache"};
+    for (const char* path : paths) {
+        FILE* fp = fopen(path, "rb");
+        if (!fp) continue;
 
-// 4. test_atomic(int* data, int n)
-static void pred_atomic(void** args, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, std::vector<std::pair<uintptr_t, size_t>>& ranges) {
-    if (!args || !args[0]) return;
-    uintptr_t data = *(uintptr_t*)args[0];
-    if (data) ranges.push_back({data, sizeof(int)});
-}
+        fseek(fp, 0, SEEK_END);
+        long file_size = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
 
-// 5. test_saxpy(float* x, float* y, float alpha, int n)
-static void pred_saxpy(void** args, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, std::vector<std::pair<uintptr_t, size_t>>& ranges) {
-    if (!args || !args[0] || !args[1] || !args[3]) return;
-    uintptr_t x = *(uintptr_t*)args[0];
-    uintptr_t y = *(uintptr_t*)args[1];
-    int n = *(int*)args[3];
-    if (x && n > 0) ranges.push_back({x, (size_t)n * sizeof(float)});
-    if (y && n > 0) ranges.push_back({y, (size_t)n * sizeof(float)});
-}
+        if (file_size < (long)sizeof(UvmKernelMetadataHeader)) {
+            fclose(fp);
+            continue;
+        }
 
-// 6. test_reduction(int* data, int* result, int n)
-static void pred_reduction(void** args, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, std::vector<std::pair<uintptr_t, size_t>>& ranges) {
-    if (!args || !args[0] || !args[1] || !args[2]) return;
-    uintptr_t data = *(uintptr_t*)args[0];
-    uintptr_t result = *(uintptr_t*)args[1];
-    int n = *(int*)args[2];
-    if (data && n > 0) ranges.push_back({data, (size_t)n * sizeof(int)});
-    if (result) ranges.push_back({result, sizeof(int)});
-}
+        std::vector<uint8_t> buf(file_size);
+        if (fread(buf.data(), 1, file_size, fp) == (size_t)file_size) {
+            size_t off = 0;
+            while (off + sizeof(UvmKernelMetadataHeader) <= buf.size()) {
+                const auto* hdr = reinterpret_cast<const UvmKernelMetadataHeader*>(buf.data() + off);
+                if (hdr->magic != UVM_METADATA_MAGIC) {
+                    off++;
+                    continue;
+                }
+                size_t table_end = off + hdr->table_size;
+                if (table_end > buf.size()) break;
+                off += sizeof(UvmKernelMetadataHeader);
 
-// 7. test_histogram(int* data, int* hist, int n, int bins)
-static void pred_histogram(void** args, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, std::vector<std::pair<uintptr_t, size_t>>& ranges) {
-    if (!args || !args[0] || !args[1] || !args[2] || !args[3]) return;
-    uintptr_t data = *(uintptr_t*)args[0];
-    uintptr_t hist = *(uintptr_t*)args[1];
-    int n = *(int*)args[2];
-    int bins = *(int*)args[3];
-    if (data && n > 0) ranges.push_back({data, (size_t)n * sizeof(int)});
-    if (hist && bins > 0) ranges.push_back({hist, (size_t)bins * sizeof(int)});
-}
+                for (uint32_t k = 0; k < hdr->num_kernels && off + sizeof(UvmKernelEntryHeader) <= table_end; ++k) {
+                    const auto* entry = reinterpret_cast<const UvmKernelEntryHeader*>(buf.data() + off);
+                    off += sizeof(UvmKernelEntryHeader);
+                    if (off + entry->name_len + 1 + entry->bytecode_len > table_end) break;
 
-// 8. test_transpose(int* in, int* out, int N)
-static void pred_transpose(void** args, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, std::vector<std::pair<uintptr_t, size_t>>& ranges) {
-    if (!args || !args[0] || !args[1] || !args[2]) return;
-    uintptr_t in = *(uintptr_t*)args[0];
-    uintptr_t out = *(uintptr_t*)args[1];
-    int N = *(int*)args[2];
-    if (in && N > 0) ranges.push_back({in, (size_t)N * N * sizeof(int)});
-    if (out && N > 0) ranges.push_back({out, (size_t)N * N * sizeof(int)});
-}
+                    std::string kname(reinterpret_cast<const char*>(buf.data() + off), entry->name_len);
+                    off += entry->name_len + 1; // skip string and null
 
-// 9. test_gemv(float* A, float* x, float* y, int M, int N)
-static void pred_gemv(void** args, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, std::vector<std::pair<uintptr_t, size_t>>& ranges) {
-    if (!args || !args[0] || !args[1] || !args[2] || !args[3] || !args[4]) return;
-    uintptr_t A = *(uintptr_t*)args[0];
-    uintptr_t x = *(uintptr_t*)args[1];
-    uintptr_t y = *(uintptr_t*)args[2];
-    int M = *(int*)args[3];
-    int N = *(int*)args[4];
-    if (A && M > 0 && N > 0) ranges.push_back({A, (size_t)M * N * sizeof(float)});
-    if (x && N > 0) ranges.push_back({x, (size_t)N * sizeof(float)});
-    if (y && M > 0) ranges.push_back({y, (size_t)M * sizeof(float)});
-}
+                    std::vector<uint8_t> bc(buf.data() + off, buf.data() + off + entry->bytecode_len);
+                    off += entry->bytecode_len;
 
-// 10. matrixMulCUDA(float* C, float* A, float* B, int wA, int wB)
-static void pred_matrixMul(void** args, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, std::vector<std::pair<uintptr_t, size_t>>& ranges) {
-    if (!args || !args[0] || !args[1] || !args[2] || !args[3] || !args[4]) return;
-    uintptr_t C = *(uintptr_t*)args[0];
-    uintptr_t A = *(uintptr_t*)args[1];
-    uintptr_t B = *(uintptr_t*)args[2];
-    int wA = *(int*)args[3];
-    int wB = *(int*)args[4];
-    int hA = (int)(gy * 32);
-    if (hA <= 0) hA = wA;
-    if (A && wA > 0) ranges.push_back({A, (size_t)hA * wA * sizeof(float)});
-    if (B && wA > 0 && wB > 0) ranges.push_back({B, (size_t)wA * wB * sizeof(float)});
-    if (C && hA > 0 && wB > 0) ranges.push_back({C, (size_t)hA * wB * sizeof(float)});
-}
-
-// 11. Polybench: 2DConvolution(DATA_TYPE* A, DATA_TYPE* B, int ni, int nj)
-static void pred_2dconv(void** args, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, std::vector<std::pair<uintptr_t, size_t>>& ranges) {
-    if (!args || !args[0] || !args[1] || !args[2] || !args[3]) return;
-    uintptr_t A = *(uintptr_t*)args[0];
-    uintptr_t B = *(uintptr_t*)args[1];
-    int ni = *(int*)args[2];
-    int nj = *(int*)args[3];
-    if (A && ni > 0 && nj > 0) ranges.push_back({A, (size_t)ni * nj * sizeof(float)});
-    if (B && ni > 0 && nj > 0) ranges.push_back({B, (size_t)ni * nj * sizeof(float)});
-}
-
-// 12. Polybench: 3DConvolution(DATA_TYPE* A, DATA_TYPE* B, int ni, int nj, int nk)
-static void pred_3dconv(void** args, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, std::vector<std::pair<uintptr_t, size_t>>& ranges) {
-    if (!args || !args[0] || !args[1] || !args[2] || !args[3] || !args[4]) return;
-    uintptr_t A = *(uintptr_t*)args[0];
-    uintptr_t B = *(uintptr_t*)args[1];
-    int ni = *(int*)args[2];
-    int nj = *(int*)args[3];
-    int nk = *(int*)args[4];
-    if (A && ni > 0 && nj > 0 && nk > 0) ranges.push_back({A, (size_t)ni * nj * nk * sizeof(float)});
-    if (B && ni > 0 && nj > 0 && nk > 0) ranges.push_back({B, (size_t)ni * nj * nk * sizeof(float)});
-}
-
-// 13. Polybench: 2mm (mm2_kernel1, mm2_kernel2)
-static void pred_2mm(void** args, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, std::vector<std::pair<uintptr_t, size_t>>& ranges) {
-    if (!args || !args[0] || !args[1] || !args[2] || !args[3] || !args[4] || !args[5] || !args[6] || !args[7]) return;
-    uintptr_t A = *(uintptr_t*)args[0];
-    uintptr_t B = *(uintptr_t*)args[1];
-    uintptr_t C = *(uintptr_t*)args[2];
-    uintptr_t D = *(uintptr_t*)args[3];
-    int ni = *(int*)args[4];
-    int nj = *(int*)args[5];
-    int nk = *(int*)args[6];
-    int nl = *(int*)args[7];
-    if (A && ni > 0 && nk > 0) ranges.push_back({A, (size_t)ni * nk * sizeof(float)});
-    if (B && nk > 0 && nj > 0) ranges.push_back({B, (size_t)nk * nj * sizeof(float)});
-    if (C && nl > 0 && nj > 0) ranges.push_back({C, (size_t)nl * nj * sizeof(float)});
-    if (D && ni > 0 && nl > 0) ranges.push_back({D, (size_t)ni * nl * sizeof(float)});
-}
-
-// 14. Polybench: atax (atax_kernel1, atax_kernel2)
-static void pred_atax(void** args, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, std::vector<std::pair<uintptr_t, size_t>>& ranges) {
-    if (!args || !args[0] || !args[1] || !args[2] || !args[3] || !args[4] || !args[5]) return;
-    uintptr_t A = *(uintptr_t*)args[0];
-    uintptr_t x = *(uintptr_t*)args[1];
-    uintptr_t y = *(uintptr_t*)args[2];
-    uintptr_t tmp = *(uintptr_t*)args[3];
-    int nx = *(int*)args[4];
-    int ny = *(int*)args[5];
-    if (A && nx > 0 && ny > 0) ranges.push_back({A, (size_t)nx * ny * sizeof(float)});
-    if (x && ny > 0) ranges.push_back({x, (size_t)ny * sizeof(float)});
-    if (y && ny > 0) ranges.push_back({y, (size_t)ny * sizeof(float)});
-    if (tmp && nx > 0) ranges.push_back({tmp, (size_t)nx * sizeof(float)});
-}
-
-// 15. Polybench: bicg (bicg_kernel1, bicg_kernel2)
-static void pred_bicg(void** args, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, std::vector<std::pair<uintptr_t, size_t>>& ranges) {
-    if (!args || !args[0] || !args[1] || !args[2] || !args[3] || !args[4] || !args[5] || !args[6]) return;
-    uintptr_t A = *(uintptr_t*)args[0];
-    uintptr_t r = *(uintptr_t*)args[1];
-    uintptr_t s = *(uintptr_t*)args[2];
-    uintptr_t p = *(uintptr_t*)args[3];
-    uintptr_t q = *(uintptr_t*)args[4];
-    int nx = *(int*)args[5];
-    int ny = *(int*)args[6];
-    if (A && nx > 0 && ny > 0) ranges.push_back({A, (size_t)nx * ny * sizeof(float)});
-    if (r && nx > 0) ranges.push_back({r, (size_t)nx * sizeof(float)});
-    if (s && ny > 0) ranges.push_back({s, (size_t)ny * sizeof(float)});
-    if (p && ny > 0) ranges.push_back({p, (size_t)ny * sizeof(float)});
-    if (q && nx > 0) ranges.push_back({q, (size_t)nx * sizeof(float)});
-}
-
-// 16. Polybench: covariance (mean_kernel, reduce_kernel, covar_kernel)
-static void pred_covariance(void** args, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, std::vector<std::pair<uintptr_t, size_t>>& ranges) {
-    if (!args || !args[0] || !args[1] || !args[2] || !args[3]) return;
-    uintptr_t p0 = *(uintptr_t*)args[0];
-    uintptr_t p1 = *(uintptr_t*)args[1];
-    long M = *(long*)args[2];
-    long N = *(long*)args[3];
-    if (p0 && M > 0 && N > 0) ranges.push_back({p0, (size_t)(M + 1) * (N + 1) * sizeof(float)});
-    if (p1 && M > 0 && N > 0) ranges.push_back({p1, (size_t)(M + 1) * (M + 1) * sizeof(float)});
-}
-
-// 17. Polybench: fdtd2d (fdtd_kernel1, fdtd_kernel2, fdtd_kernel3)
-static void pred_fdtd2d(void** args, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, std::vector<std::pair<uintptr_t, size_t>>& ranges) {
-    if (!args || !args[0] || !args[1] || !args[2] || !args[3] || !args[4] || !args[5] || !args[6]) return;
-    uintptr_t fict = *(uintptr_t*)args[0];
-    uintptr_t ex = *(uintptr_t*)args[1];
-    uintptr_t ey = *(uintptr_t*)args[2];
-    uintptr_t hz = *(uintptr_t*)args[3];
-    int tmax = *(int*)args[4];
-    int nx = *(int*)args[5];
-    int ny = *(int*)args[6];
-    if (fict && tmax > 0) ranges.push_back({fict, (size_t)tmax * sizeof(float)});
-    if (ex && nx > 0 && ny > 0) ranges.push_back({ex, (size_t)nx * (ny + 1) * sizeof(float)});
-    if (ey && nx > 0 && ny > 0) ranges.push_back({ey, (size_t)(nx + 1) * ny * sizeof(float)});
-    if (hz && nx > 0 && ny > 0) ranges.push_back({hz, (size_t)nx * ny * sizeof(float)});
-}
-
-// 18. Polybench: gramschmidt (gramschmidt_kernel1, 2, 3)
-static void pred_gramschmidt(void** args, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, std::vector<std::pair<uintptr_t, size_t>>& ranges) {
-    if (!args || !args[0] || !args[1] || !args[2] || !args[3] || !args[4]) return;
-    uintptr_t A = *(uintptr_t*)args[0];
-    uintptr_t R = *(uintptr_t*)args[1];
-    uintptr_t Q = *(uintptr_t*)args[2];
-    int ni = *(int*)args[3];
-    int nj = *(int*)args[4];
-    if (A && ni > 0 && nj > 0) ranges.push_back({A, (size_t)ni * nj * sizeof(float)});
-    if (R && nj > 0) ranges.push_back({R, (size_t)nj * nj * sizeof(float)});
-    if (Q && ni > 0 && nj > 0) ranges.push_back({Q, (size_t)ni * nj * sizeof(float)});
-}
-
-// 19. Polybench: syr2k
-static void pred_syr2k(void** args, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, std::vector<std::pair<uintptr_t, size_t>>& ranges) {
-    if (!args || !args[0] || !args[1] || !args[2] || !args[3] || !args[4]) return;
-    uintptr_t A = *(uintptr_t*)args[0];
-    uintptr_t B = *(uintptr_t*)args[1];
-    uintptr_t C = *(uintptr_t*)args[2];
-    long M = *(long*)args[3];
-    long N = *(long*)args[4];
-    if (A && N > 0 && M > 0) ranges.push_back({A, (size_t)N * M * sizeof(float)});
-    if (B && N > 0 && M > 0) ranges.push_back({B, (size_t)N * M * sizeof(float)});
-    if (C && N > 0) ranges.push_back({C, (size_t)N * N * sizeof(float)});
-}
-
-// 20. Polybench: syrk(DATA_TYPE ALPHA, DATA_TYPE BETA, DATA_TYPE *a, DATA_TYPE *c, long M, long N)
-static void pred_syrk(void** args, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, std::vector<std::pair<uintptr_t, size_t>>& ranges) {
-    if (!args || !args[2] || !args[3] || !args[4] || !args[5]) return;
-    uintptr_t A = *(uintptr_t*)args[2];
-    uintptr_t C = *(uintptr_t*)args[3];
-    long M = *(long*)args[4];
-    long N = *(long*)args[5];
-    if (A && N > 0 && M > 0) ranges.push_back({A, (size_t)N * M * sizeof(float)});
-    if (C && N > 0) ranges.push_back({C, (size_t)N * N * sizeof(float)});
-}
-
-// 21. Rodinia: needle_cuda_shared_* (int *reference, int *matrix_cuda, int cols, int penalty, int i, int block_width)
-static void pred_needle(void** args, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, std::vector<std::pair<uintptr_t, size_t>>& ranges) {
-    if (!args || !args[0] || !args[1] || !args[2]) return;
-    uintptr_t ref = *(uintptr_t*)args[0];
-    uintptr_t mat = *(uintptr_t*)args[1];
-    int cols = *(int*)args[2];
-    if (ref && cols > 0) ranges.push_back({ref, (size_t)(cols + 1) * (cols + 1) * sizeof(int)});
-    if (mat && cols > 0) ranges.push_back({mat, (size_t)(cols + 1) * (cols + 1) * sizeof(int)});
-}
-
-// 22. CUTLASS / Templated Gemm (scans argument struct for memory buffers)
-static void pred_cutlass(void** args, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, std::vector<std::pair<uintptr_t, size_t>>& ranges) {
-    if (!args || !args[0]) return;
-    std::lock_guard<std::recursive_mutex> lock(g_mutex);
-    uintptr_t* ptr_scan = (uintptr_t*)args[0];
-    for (int i = 0; i < 64; ++i) {
-        uintptr_t candidate = ptr_scan[i];
-        if (candidate < 0x10000) continue;
-        for (const auto& alloc : g_active) {
-            uintptr_t base = (uintptr_t)alloc.ptr;
-            if (candidate >= base && candidate < base + alloc.size) {
-                bool exists = false;
-                for (auto& r : ranges) if (r.first == base) { exists = true; break; }
-                if (!exists) ranges.push_back({base, alloc.size});
+                    KernelBytecodePolicy pol;
+                    pol.name = kname;
+                    pol.flags = entry->flags;
+                    pol.num_ranges = entry->num_ranges;
+                    pol.bytecode = std::move(bc);
+                    g_metadata_registry[kname] = pol;
+                }
             }
         }
+        fclose(fp);
     }
 }
 
-static FootprintPredictorFunc find_predictor_for_name(const std::string& dev_name) {
-    if (dev_name.find("test_coalesced") != std::string::npos) return pred_coalesced;
-    if (dev_name.find("test_stride") != std::string::npos) return pred_stride;
-    if (dev_name.find("test_stencil") != std::string::npos) return pred_stencil;
-    if (dev_name.find("test_atomic") != std::string::npos) return pred_atomic;
-    if (dev_name.find("test_saxpy") != std::string::npos) return pred_saxpy;
-    if (dev_name.find("test_reduction") != std::string::npos) return pred_reduction;
-    if (dev_name.find("test_histogram") != std::string::npos) return pred_histogram;
-    if (dev_name.find("test_transpose") != std::string::npos) return pred_transpose;
-    if (dev_name.find("test_gemv") != std::string::npos) return pred_gemv;
-    if (dev_name.find("MatrixMul") != std::string::npos || dev_name.find("matrixMul") != std::string::npos) return pred_matrixMul;
-    if (dev_name.find("Convolution2D") != std::string::npos) return pred_2dconv;
-    if (dev_name.find("Convolution3D") != std::string::npos) return pred_3dconv;
-    if (dev_name.find("mm2_") != std::string::npos) return pred_2mm;
-    if (dev_name.find("atax_") != std::string::npos) return pred_atax;
-    if (dev_name.find("bicg_") != std::string::npos) return pred_bicg;
-    if (dev_name.find("mean_kernel") != std::string::npos || 
-        dev_name.find("reduce_kernel") != std::string::npos ||
-        dev_name.find("covar_kernel") != std::string::npos) return pred_covariance;
-    if (dev_name.find("fdtd_") != std::string::npos) return pred_fdtd2d;
-    if (dev_name.find("gramschmidt_") != std::string::npos) return pred_gramschmidt;
-    if (dev_name.find("needle") != std::string::npos) return pred_needle;
-    if (dev_name.find("syr2k_") != std::string::npos) return pred_syr2k;
-    if (dev_name.find("syrk_") != std::string::npos) return pred_syrk;
-    if (dev_name.find("cutlass") != std::string::npos || dev_name.find("Kernel") != std::string::npos) return pred_cutlass;
-    return nullptr;
+static bool evaluate_bytecode(
+    const uint8_t* bc, size_t bc_len,
+    void** args,
+    unsigned int gx, unsigned int gy, unsigned int gz,
+    unsigned int bx, unsigned int by, unsigned int bz,
+    const std::vector<ActiveAlloc>& active_allocs,
+    std::vector<std::pair<uintptr_t, size_t>>& out_ranges
+) {
+    if (!bc || bc_len == 0) return false;
+    uint64_t stack[64];
+    int sp = 0;
+
+    auto push = [&](uint64_t val) {
+        if (sp < 64) stack[sp++] = val;
+    };
+    auto pop = [&]() -> uint64_t {
+        return (sp > 0) ? stack[--sp] : 0;
+    };
+
+    size_t ip = 0;
+    while (ip < bc_len) {
+        uint8_t op = bc[ip++];
+        if (op == (uint8_t)UvmOpcode::OP_END) break;
+
+        switch ((UvmOpcode)op) {
+        case UvmOpcode::OP_CONST_U64: {
+            if (ip + sizeof(uint64_t) > bc_len) return false;
+            uint64_t v = 0;
+            memcpy(&v, bc + ip, sizeof(uint64_t));
+            ip += sizeof(uint64_t);
+            push(v);
+            break;
+        }
+        case UvmOpcode::OP_CONST_U32: {
+            if (ip + sizeof(uint32_t) > bc_len) return false;
+            uint32_t v = 0;
+            memcpy(&v, bc + ip, sizeof(uint32_t));
+            ip += sizeof(uint32_t);
+            push(v);
+            break;
+        }
+        case UvmOpcode::OP_ARG_U8: {
+            uint8_t idx = bc[ip++];
+            if (args && args[idx]) push(*(uint8_t*)args[idx]); else push(0);
+            break;
+        }
+        case UvmOpcode::OP_ARG_I8: {
+            uint8_t idx = bc[ip++];
+            if (args && args[idx]) push((int64_t)*(int8_t*)args[idx]); else push(0);
+            break;
+        }
+        case UvmOpcode::OP_ARG_U16: {
+            uint8_t idx = bc[ip++];
+            if (args && args[idx]) push(*(uint16_t*)args[idx]); else push(0);
+            break;
+        }
+        case UvmOpcode::OP_ARG_I16: {
+            uint8_t idx = bc[ip++];
+            if (args && args[idx]) push((int64_t)*(int16_t*)args[idx]); else push(0);
+            break;
+        }
+        case UvmOpcode::OP_ARG_U32: {
+            uint8_t idx = bc[ip++];
+            if (args && args[idx]) push(*(uint32_t*)args[idx]); else push(0);
+            break;
+        }
+        case UvmOpcode::OP_ARG_I32: {
+            uint8_t idx = bc[ip++];
+            if (args && args[idx]) push((int64_t)*(int32_t*)args[idx]); else push(0);
+            break;
+        }
+        case UvmOpcode::OP_ARG_U64: {
+            uint8_t idx = bc[ip++];
+            if (args && args[idx]) push(*(uint64_t*)args[idx]); else push(0);
+            break;
+        }
+        case UvmOpcode::OP_ARG_I64: {
+            uint8_t idx = bc[ip++];
+            if (args && args[idx]) push((int64_t)*(int64_t*)args[idx]); else push(0);
+            break;
+        }
+        case UvmOpcode::OP_ARG_PTR: {
+            uint8_t idx = bc[ip++];
+            if (args && args[idx]) push(*(uintptr_t*)args[idx]); else push(0);
+            break;
+        }
+        case UvmOpcode::OP_GRID_DIM_X: push(gx); break;
+        case UvmOpcode::OP_GRID_DIM_Y: push(gy); break;
+        case UvmOpcode::OP_GRID_DIM_Z: push(gz); break;
+        case UvmOpcode::OP_BLOCK_DIM_X: push(bx); break;
+        case UvmOpcode::OP_BLOCK_DIM_Y: push(by); break;
+        case UvmOpcode::OP_BLOCK_DIM_Z: push(bz); break;
+
+        case UvmOpcode::OP_ADD: {
+            uint64_t b = pop();
+            uint64_t a = pop();
+            push(a + b);
+            break;
+        }
+        case UvmOpcode::OP_SUB: {
+            uint64_t b = pop();
+            uint64_t a = pop();
+            push(a - b);
+            break;
+        }
+        case UvmOpcode::OP_MUL: {
+            uint64_t b = pop();
+            uint64_t a = pop();
+            push(a * b);
+            break;
+        }
+        case UvmOpcode::OP_DIV: {
+            uint64_t b = pop();
+            uint64_t a = pop();
+            push(b != 0 ? (a / b) : 0);
+            break;
+        }
+        case UvmOpcode::OP_SHL: {
+            uint64_t b = pop();
+            uint64_t a = pop();
+            push(a << b);
+            break;
+        }
+        case UvmOpcode::OP_MAX: {
+            uint64_t b = pop();
+            uint64_t a = pop();
+            push(a > b ? a : b);
+            break;
+        }
+        case UvmOpcode::OP_MIN: {
+            uint64_t b = pop();
+            uint64_t a = pop();
+            push(a < b ? a : b);
+            break;
+        }
+        case UvmOpcode::OP_EMIT_RANGE: {
+            uint64_t size = pop();
+            uint64_t base = pop();
+            if (base != 0 && size > 0) {
+                out_ranges.push_back({(uintptr_t)base, (size_t)size});
+            }
+            break;
+        }
+        case UvmOpcode::OP_EMIT_ARG_RANGE: {
+            uint8_t arg_idx = bc[ip++];
+            uint64_t size = pop();
+            if (args && args[arg_idx]) {
+                uintptr_t base = *(uintptr_t*)args[arg_idx];
+                if (base != 0 && size > 0) {
+                    out_ranges.push_back({base, (size_t)size});
+                }
+            }
+            break;
+        }
+        case UvmOpcode::OP_SCAN_ACTIVE_ALLOCS: {
+            uint8_t arg_idx = bc[ip++];
+            if (args) {
+                void* scan_buf = (arg_idx != 0xFF && args[arg_idx]) ? args[arg_idx] : args[0];
+                if (scan_buf) {
+                    uint8_t* byte_scan = (uint8_t*)scan_buf;
+                    for (size_t offset = 0; offset + sizeof(uintptr_t) <= 512; offset += 4) {
+                        uintptr_t cand = 0;
+                        memcpy(&cand, byte_scan + offset, sizeof(uintptr_t));
+                        if (cand < 0x10000) continue;
+                        for (const auto& alloc : active_allocs) {
+                            uintptr_t base = (uintptr_t)alloc.ptr;
+                            if (cand >= base && cand < base + alloc.size) {
+                                bool exists = false;
+                                for (auto& r : out_ranges) if (r.first == base) { exists = true; break; }
+                                if (!exists) out_ranges.push_back({base, alloc.size});
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        default:
+            return false;
+        }
+    }
+    return true;
+}
+
+static inline void predict_and_mark_ranges(
+    const KernelPolicyDescriptor& desc,
+    void** args,
+    unsigned int gx, unsigned int gy, unsigned int gz,
+    unsigned int bx, unsigned int by, unsigned int bz,
+    void* stream
+) {
+    std::vector<std::pair<uintptr_t, size_t>> ranges;
+    if (!desc.bytecode.empty()) {
+        std::vector<ActiveAlloc> active_copy;
+        {
+            std::lock_guard<std::recursive_mutex> lock(g_mutex);
+            active_copy = g_active;
+        }
+        evaluate_bytecode(desc.bytecode.data(), desc.bytecode.size(), args,
+                          gx, gy, gz, bx, by, bz, active_copy, ranges);
+    } else if (desc.predictor_fn) {
+        desc.predictor_fn(args, gx, gy, gz, bx, by, bz, ranges);
+    }
+    const char* dbg = getenv("UVM_DEBUG_PREDICT");
+    if (dbg && dbg[0] == '1') {
+        fprintf(stderr, "[DEBUG PREDICT] Kernel %s emitted %zu ranges (active allocs: %zu)\n",
+                desc.kernel_name.c_str(), ranges.size(), g_active.size());
+        for (const auto& r : ranges) {
+            fprintf(stderr, "   -> Range: base=%p, size=%zu (%zu pages)\n",
+                    (void*)r.first, r.second, (r.second + 4095) / 4096);
+        }
+    }
+    if (mark_predicted_range_fn) {
+        for (const auto& r : ranges) {
+            mark_predicted_range_fn(r.first, r.second, stream);
+        }
+    }
 }
 
 // ── Helper: resolve real CUDA functions ──────────────────────────────────────
 static void ensure_init()
 {
     if (g_init_done) return;
+
+    load_metadata_cache();
 
     real_cudaMallocManaged =
         (cudaMallocManaged_t)dlsym(RTLD_NEXT, "cudaMallocManaged");
@@ -659,14 +648,19 @@ extern "C" void __cudaRegisterFunction(
         g_runtime_map[(const void*)hostFun] = (const void*)tracked_stub;
         g_runtime_names[(const void*)hostFun] = dev_name;
 
-        // Configure policy for this kernel
+        // Configure policy using compiler-generated bytecode metadata
         KernelPolicyDescriptor desc;
         desc.kernel_name = dev_name;
         desc.clean_func = hostFun;
         desc.instrumented_func = tracked_stub;
         desc.enabled = true;
-        desc.predictor_fn = find_predictor_for_name(dev_name);
-        if (desc.predictor_fn != nullptr) {
+
+        auto it = g_metadata_registry.find(dev_name);
+        if (it != g_metadata_registry.end()) {
+            desc.bytecode = it->second.bytecode;
+            desc.strategy = TrackingStrategy::PREDICT_HOST;
+        } else if (dev_name.find("cutlass") != std::string::npos || dev_name.find("Gemm") != std::string::npos) {
+            desc.bytecode = { (uint8_t)UvmOpcode::OP_SCAN_ACTIVE_ALLOCS, 0xFF, (uint8_t)UvmOpcode::OP_END };
             desc.strategy = TrackingStrategy::PREDICT_HOST;
         } else {
             desc.strategy = TrackingStrategy::INSTRUMENT_GPU;
@@ -718,15 +712,10 @@ extern "C" cudaError_t cudaLaunchKernel(
         if (desc.strategy == TrackingStrategy::SKIP_TRACKING) {
             return real_cudaLaunchKernel ? real_cudaLaunchKernel(func, gridDim, blockDim, args, sharedMem, stream) : cudaSuccess;
         }
-        if ((desc.strategy == TrackingStrategy::PREDICT_HOST || desc.strategy == TrackingStrategy::AUTO_DETECT) && desc.predictor_fn) {
-            // Predict memory footprint on host and mark shadow table
-            std::vector<std::pair<uintptr_t, size_t>> ranges;
-            desc.predictor_fn(args, gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, ranges);
-            if (mark_predicted_range_fn) {
-                for (const auto& r : ranges) {
-                    mark_predicted_range_fn(r.first, r.second, stream);
-                }
-            }
+        if ((desc.strategy == TrackingStrategy::PREDICT_HOST || desc.strategy == TrackingStrategy::AUTO_DETECT) &&
+            (!desc.bytecode.empty() || desc.predictor_fn)) {
+            // Predict memory footprint dynamically from bytecode on host and mark shadow table
+            predict_and_mark_ranges(desc, args, gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, stream);
             // Launch CLEAN kernel with 0.0% GPU overhead!
             return real_cudaLaunchKernel ? real_cudaLaunchKernel(func, gridDim, blockDim, args, sharedMem, stream) : cudaSuccess;
         }
@@ -781,15 +770,10 @@ extern "C" cudaError_t cudaLaunchKernelExC(
         if (desc.strategy == TrackingStrategy::SKIP_TRACKING) {
             return real_cudaLaunchKernelExC ? real_cudaLaunchKernelExC(config, func, args) : cudaSuccess;
         }
-        if ((desc.strategy == TrackingStrategy::PREDICT_HOST || desc.strategy == TrackingStrategy::AUTO_DETECT) && desc.predictor_fn) {
-            std::vector<std::pair<uintptr_t, size_t>> ranges;
-            desc.predictor_fn(args, config->gridDim.x, config->gridDim.y, config->gridDim.z,
-                              config->blockDim.x, config->blockDim.y, config->blockDim.z, ranges);
-            if (mark_predicted_range_fn) {
-                for (const auto& r : ranges) {
-                    mark_predicted_range_fn(r.first, r.second, config->stream);
-                }
-            }
+        if ((desc.strategy == TrackingStrategy::PREDICT_HOST || desc.strategy == TrackingStrategy::AUTO_DETECT) &&
+            (!desc.bytecode.empty() || desc.predictor_fn)) {
+            predict_and_mark_ranges(desc, args, config->gridDim.x, config->gridDim.y, config->gridDim.z,
+                                   config->blockDim.x, config->blockDim.y, config->blockDim.z, config->stream);
             return real_cudaLaunchKernelExC ? real_cudaLaunchKernelExC(config, func, args) : cudaSuccess;
         }
     }
@@ -834,8 +818,13 @@ extern "C" CUresult cuModuleGetFunction(
                 KernelPolicyDescriptor desc;
                 desc.kernel_name = sname;
                 desc.enabled = true;
-                desc.predictor_fn = find_predictor_for_name(sname);
-                if (desc.predictor_fn != nullptr) {
+
+                auto it = g_metadata_registry.find(sname);
+                if (it != g_metadata_registry.end()) {
+                    desc.bytecode = it->second.bytecode;
+                    desc.strategy = TrackingStrategy::PREDICT_HOST;
+                } else if (sname.find("cutlass") != std::string::npos || sname.find("Gemm") != std::string::npos) {
+                    desc.bytecode = { (uint8_t)UvmOpcode::OP_SCAN_ACTIVE_ALLOCS, 0xFF, (uint8_t)UvmOpcode::OP_END };
                     desc.strategy = TrackingStrategy::PREDICT_HOST;
                 } else {
                     desc.strategy = TrackingStrategy::INSTRUMENT_GPU;
@@ -885,15 +874,10 @@ extern "C" CUresult cuLaunchKernel(
                                                              blockDimX, blockDimY, blockDimZ,
                                                              sharedMemBytes, hStream, kernelParams, extra) : 0;
         }
-        if ((desc.strategy == TrackingStrategy::PREDICT_HOST || desc.strategy == TrackingStrategy::AUTO_DETECT) && desc.predictor_fn) {
-            std::vector<std::pair<uintptr_t, size_t>> ranges;
-            desc.predictor_fn(kernelParams, gridDimX, gridDimY, gridDimZ,
-                              blockDimX, blockDimY, blockDimZ, ranges);
-            if (mark_predicted_range_fn) {
-                for (const auto& r : ranges) {
-                    mark_predicted_range_fn(r.first, r.second, (void*)hStream);
-                }
-            }
+        if ((desc.strategy == TrackingStrategy::PREDICT_HOST || desc.strategy == TrackingStrategy::AUTO_DETECT) &&
+            (!desc.bytecode.empty() || desc.predictor_fn)) {
+            predict_and_mark_ranges(desc, kernelParams, gridDimX, gridDimY, gridDimZ,
+                                   blockDimX, blockDimY, blockDimZ, (void*)hStream);
             return real_cuLaunchKernel ? real_cuLaunchKernel(f, gridDimX, gridDimY, gridDimZ,
                                                              blockDimX, blockDimY, blockDimZ,
                                                              sharedMemBytes, hStream, kernelParams, extra) : 0;
@@ -946,15 +930,10 @@ extern "C" CUresult cuLaunchKernelEx(
         if (desc.strategy == TrackingStrategy::SKIP_TRACKING) {
             return real_cuLaunchKernelEx ? real_cuLaunchKernelEx(config, f, kernelParams, extra) : 0;
         }
-        if ((desc.strategy == TrackingStrategy::PREDICT_HOST || desc.strategy == TrackingStrategy::AUTO_DETECT) && desc.predictor_fn) {
-            std::vector<std::pair<uintptr_t, size_t>> ranges;
-            desc.predictor_fn(kernelParams, config->gridDimX, config->gridDimY, config->gridDimZ,
-                              config->blockDimX, config->blockDimY, config->blockDimZ, ranges);
-            if (mark_predicted_range_fn) {
-                for (const auto& r : ranges) {
-                    mark_predicted_range_fn(r.first, r.second, (void*)config->hStream);
-                }
-            }
+        if ((desc.strategy == TrackingStrategy::PREDICT_HOST || desc.strategy == TrackingStrategy::AUTO_DETECT) &&
+            (!desc.bytecode.empty() || desc.predictor_fn)) {
+            predict_and_mark_ranges(desc, kernelParams, config->gridDimX, config->gridDimY, config->gridDimZ,
+                                   config->blockDimX, config->blockDimY, config->blockDimZ, (void*)config->hStream);
             return real_cuLaunchKernelEx ? real_cuLaunchKernelEx(config, f, kernelParams, extra) : 0;
         }
     }

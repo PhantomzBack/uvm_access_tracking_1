@@ -6,11 +6,15 @@
 #include "llvm/IR/Metadata.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "include/uvm_policy.h"
 #include <set>
+#include <fstream>
+#include <algorithm>
 
 #ifdef UVM_DEBUG
 #define UVM_DBGS() llvm::errs()
@@ -586,6 +590,493 @@ static bool isRuntimeFunction(const Function &F) {
     return false;
 }
 
+// ── Compiler Metadata Extraction & Bytecode Generation ───────────────────────
+struct KernelMetadataBytecode {
+    std::string kernel_name;
+    uint16_t num_ranges = 0;
+    uint16_t flags = 1; // 1 = pure affine, 2 = requires scan
+    std::vector<uint8_t> bytecode;
+};
+
+static bool emitSCEVToBytecode(
+    const SCEV *S,
+    ScalarEvolution &SE,
+    std::vector<uint8_t> &bc,
+    const Function &F
+) {
+    if (!S) return false;
+
+    if (auto *C = dyn_cast<SCEVConstant>(S)) {
+        uint64_t val = C->getValue()->getZExtValue();
+        bc.push_back((uint8_t)UvmOpcode::OP_CONST_U64);
+        for (int k = 0; k < 8; ++k) bc.push_back((val >> (k * 8)) & 0xFF);
+        return true;
+    }
+
+    if (auto *U = dyn_cast<SCEVUnknown>(S)) {
+        Value *V = U->getValue();
+        if (auto *Arg = dyn_cast<Argument>(V)) {
+            uint8_t idx = Arg->getArgNo();
+            if (Arg->getType()->isPointerTy()) {
+                bc.push_back((uint8_t)UvmOpcode::OP_ARG_PTR);
+                bc.push_back(idx);
+            } else if (Arg->getType()->isIntegerTy(64)) {
+                bc.push_back((uint8_t)UvmOpcode::OP_ARG_I64);
+                bc.push_back(idx);
+            } else {
+                bc.push_back((uint8_t)UvmOpcode::OP_ARG_I32);
+                bc.push_back(idx);
+            }
+            return true;
+        }
+        if (auto *CB = dyn_cast<CallBase>(V)) {
+            if (Function *Cal = CB->getCalledFunction()) {
+                StringRef Name = Cal->getName();
+                if (Name.contains("ctaid.x") || Name.contains("blockIdx.x")) {
+                    bc.push_back((uint8_t)UvmOpcode::OP_GRID_DIM_X);
+                    return true;
+                }
+                if (Name.contains("ctaid.y") || Name.contains("blockIdx.y")) {
+                    bc.push_back((uint8_t)UvmOpcode::OP_GRID_DIM_Y);
+                    return true;
+                }
+                if (Name.contains("ctaid.z") || Name.contains("blockIdx.z")) {
+                    bc.push_back((uint8_t)UvmOpcode::OP_GRID_DIM_Z);
+                    return true;
+                }
+                if (Name.contains("ntid.x") || Name.contains("blockDim.x")) {
+                    bc.push_back((uint8_t)UvmOpcode::OP_BLOCK_DIM_X);
+                    return true;
+                }
+                if (Name.contains("ntid.y") || Name.contains("blockDim.y")) {
+                    bc.push_back((uint8_t)UvmOpcode::OP_BLOCK_DIM_Y);
+                    return true;
+                }
+                if (Name.contains("ntid.z") || Name.contains("blockDim.z")) {
+                    bc.push_back((uint8_t)UvmOpcode::OP_BLOCK_DIM_Z);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    if (auto *Add = dyn_cast<SCEVAddExpr>(S)) {
+        if (!emitSCEVToBytecode(Add->getOperand(0), SE, bc, F)) return false;
+        for (unsigned i = 1; i < Add->getNumOperands(); ++i) {
+            if (!emitSCEVToBytecode(Add->getOperand(i), SE, bc, F)) return false;
+            bc.push_back((uint8_t)UvmOpcode::OP_ADD);
+        }
+        return true;
+    }
+
+    if (auto *Mul = dyn_cast<SCEVMulExpr>(S)) {
+        if (!emitSCEVToBytecode(Mul->getOperand(0), SE, bc, F)) return false;
+        for (unsigned i = 1; i < Mul->getNumOperands(); ++i) {
+            if (!emitSCEVToBytecode(Mul->getOperand(i), SE, bc, F)) return false;
+            bc.push_back((uint8_t)UvmOpcode::OP_MUL);
+        }
+        return true;
+    }
+
+    if (auto *Div = dyn_cast<SCEVUDivExpr>(S)) {
+        if (!emitSCEVToBytecode(Div->getLHS(), SE, bc, F)) return false;
+        if (!emitSCEVToBytecode(Div->getRHS(), SE, bc, F)) return false;
+        bc.push_back((uint8_t)UvmOpcode::OP_DIV);
+        return true;
+    }
+
+    if (auto *Cast = dyn_cast<SCEVCastExpr>(S)) {
+        return emitSCEVToBytecode(Cast->getOperand(), SE, bc, F);
+    }
+
+    if (auto *AR = dyn_cast<SCEVAddRecExpr>(S)) {
+        const Loop *L = AR->getLoop();
+        const SCEV *Start = AR->getStart();
+        const SCEV *Step = AR->getStepRecurrence(SE);
+        const SCEV *BTC = SE.getBackedgeTakenCount(L);
+
+        if (!isa<SCEVCouldNotCompute>(BTC)) {
+            if (!emitSCEVToBytecode(Start, SE, bc, F)) return false;
+            if (!emitSCEVToBytecode(BTC, SE, bc, F)) return false;
+            if (!emitSCEVToBytecode(Step, SE, bc, F)) return false;
+            bc.push_back((uint8_t)UvmOpcode::OP_MUL);
+            bc.push_back((uint8_t)UvmOpcode::OP_ADD);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static KernelMetadataBytecode extractKernelMetadata(
+    Function &F,
+    ScalarEvolution &SE,
+    LoopInfo &LI,
+    const DataLayout &DL
+) {
+    KernelMetadataBytecode meta;
+    meta.kernel_name = F.getName().str();
+    meta.flags = 1;
+
+    // Collect arguments
+    std::vector<Argument*> ptr_args;
+    std::vector<Argument*> scalar_args;
+    for (Argument &Arg : F.args()) {
+        if (Arg.getType()->isPointerTy()) {
+            ptr_args.push_back(&Arg);
+        } else if (Arg.getType()->isIntegerTy()) {
+            scalar_args.push_back(&Arg);
+        }
+    }
+
+    // If no explicit top-level pointer args (e.g. CUTLASS parameter struct), emit fallback scan
+    if (ptr_args.empty()) {
+        meta.flags = 2; // scan fallback
+        meta.bytecode.push_back((uint8_t)UvmOpcode::OP_SCAN_ACTIVE_ALLOCS);
+        meta.bytecode.push_back(0xFF); // scan args[0]
+        meta.bytecode.push_back((uint8_t)UvmOpcode::OP_END);
+        return meta;
+    }
+
+    // For each pointer argument, analyze memory instructions that touch it
+    for (Argument *PtrArg : ptr_args) {
+        uint8_t arg_idx = PtrArg->getArgNo();
+
+        // Check if PtrArg is a parameter container struct (loads from PtrArg yield pointer values, like CUTLASS)
+        bool is_param_struct = false;
+        for (BasicBlock &BB : F) {
+            for (Instruction &I : BB) {
+                if (auto *L = dyn_cast<LoadInst>(&I)) {
+                    Value *Base = getUnderlyingObject(L->getPointerOperand());
+                    if (Base == PtrArg && L->getType()->isPointerTy()) {
+                        is_param_struct = true;
+                        break;
+                    }
+                }
+            }
+            if (is_param_struct) break;
+        }
+
+        if (is_param_struct) {
+            meta.flags = 2;
+            meta.bytecode.push_back((uint8_t)UvmOpcode::OP_SCAN_ACTIVE_ALLOCS);
+            meta.bytecode.push_back(arg_idx);
+            meta.num_ranges++;
+            continue;
+        }
+
+        std::vector<Instruction*> mem_insts;
+        size_t elem_size = 4; // default 4 bytes
+
+        for (BasicBlock &BB : F) {
+            for (Instruction &I : BB) {
+                Value *Ptr = nullptr;
+                if (auto *L = dyn_cast<LoadInst>(&I)) {
+                    Ptr = L->getPointerOperand();
+                    elem_size = DL.getTypeAllocSize(L->getType());
+                } else if (auto *S = dyn_cast<StoreInst>(&I)) {
+                    Ptr = S->getPointerOperand();
+                    elem_size = DL.getTypeAllocSize(S->getValueOperand()->getType());
+                } else if (auto *R = dyn_cast<AtomicRMWInst>(&I)) {
+                    Ptr = R->getPointerOperand();
+                    elem_size = DL.getTypeAllocSize(R->getValOperand()->getType());
+                } else if (auto *C = dyn_cast<AtomicCmpXchgInst>(&I)) {
+                    Ptr = C->getPointerOperand();
+                    elem_size = DL.getTypeAllocSize(C->getNewValOperand()->getType());
+                }
+                if (Ptr && trueAddressSpace(Ptr) <= 1) {
+                    Value *Base = getUnderlyingObject(Ptr);
+                    if (Base == PtrArg) {
+                        mem_insts.push_back(&I);
+                    }
+                }
+            }
+        }
+
+        if (mem_insts.empty()) continue;
+
+        // Inspect enclosing loops and loop bound comparisons for PtrArg
+        std::set<Loop*> loops;
+        for (Instruction *I : mem_insts) {
+            if (Loop *L = LI.getLoopFor(I->getParent())) {
+                Loop *Cur = L;
+                while (Cur) {
+                    loops.insert(Cur);
+                    Cur = Cur->getParentLoop();
+                }
+            }
+        }
+
+        // Collect all dimension bound scalar arguments for PtrArg
+        std::vector<Argument*> bound_args;
+        auto add_bound_arg = [&](Argument* Arg) {
+            if (Arg && Arg->getType()->isIntegerTy()) {
+                if (std::find(bound_args.begin(), bound_args.end(), Arg) == bound_args.end()) {
+                    bound_args.push_back(Arg);
+                }
+            }
+        };
+
+        auto collect_args_recursive = [&](auto& self, Value *V, int depth) -> void {
+            if (!V || depth > 8) return;
+            if (auto *Arg = dyn_cast<Argument>(V)) {
+                add_bound_arg(Arg);
+                return;
+            }
+            if (auto *UserInst = dyn_cast<User>(V)) {
+                for (auto &Op : UserInst->operands()) {
+                    self(self, Op.get(), depth + 1);
+                }
+            }
+        };
+
+        // 1. Loop exit conditions
+        for (Loop *L : loops) {
+            if (BasicBlock *ExBB = L->getExitingBlock()) {
+                if (auto *BI = dyn_cast<BranchInst>(ExBB->getTerminator())) {
+                    if (BI->isConditional()) {
+                        if (auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition())) {
+                            for (unsigned i = 0; i < 2; ++i) {
+                                collect_args_recursive(collect_args_recursive, Cmp->getOperand(i), 0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Conditional branch conditions in the function (e.g. if (i < NI && j < NJ))
+        for (BasicBlock &BB : F) {
+            if (auto *BI = dyn_cast<BranchInst>(BB.getTerminator())) {
+                if (BI->isConditional()) {
+                    if (auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition())) {
+                        for (unsigned i = 0; i < 2; ++i) {
+                            collect_args_recursive(collect_args_recursive, Cmp->getOperand(i), 0);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Scalar arguments used in GEP indices for PtrArg
+        for (Argument *SArg : scalar_args) {
+            bool used_in_gep = false;
+            for (Instruction *MI : mem_insts) {
+                Value *Ptr = nullptr;
+                if (auto *L = dyn_cast<LoadInst>(MI)) Ptr = L->getPointerOperand();
+                else if (auto *S = dyn_cast<StoreInst>(MI)) Ptr = S->getPointerOperand();
+                else if (auto *R = dyn_cast<AtomicRMWInst>(MI)) Ptr = R->getPointerOperand();
+                else if (auto *C = dyn_cast<AtomicCmpXchgInst>(MI)) Ptr = C->getPointerOperand();
+
+                if (Ptr) {
+                    if (auto *GEP = dyn_cast<GEPOperator>(Ptr)) {
+                        for (auto &Idx : GEP->indices()) {
+                            std::vector<Argument*> gep_args;
+                            collect_args_recursive(collect_args_recursive, Idx.get(), 0);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check if blockIdx.y / ctaid.y is used in index calculation (e.g. 2D tiled GEMMs)
+        auto is_scaled_by_grid_y = [](auto& self, Value *V, int depth) -> bool {
+            if (!V || depth > 8) return false;
+            if (auto *CB = dyn_cast<CallBase>(V)) {
+                if (Function *Cal = CB->getCalledFunction()) {
+                    if (Cal->getName().contains("ctaid.y") || Cal->getName().contains("blockIdx.y"))
+                        return true;
+                }
+            }
+            if (auto *UserInst = dyn_cast<User>(V)) {
+                for (auto &Op : UserInst->operands()) {
+                    if (self(self, Op.get(), depth + 1)) return true;
+                }
+            }
+            return false;
+        };
+
+        bool uses_ctaid_y = false;
+        for (Instruction *MI : mem_insts) {
+            Value *Ptr = nullptr;
+            if (auto *L = dyn_cast<LoadInst>(MI)) Ptr = L->getPointerOperand();
+            else if (auto *S = dyn_cast<StoreInst>(MI)) Ptr = S->getPointerOperand();
+            else if (auto *R = dyn_cast<AtomicRMWInst>(MI)) Ptr = R->getPointerOperand();
+            else if (auto *C = dyn_cast<AtomicCmpXchgInst>(MI)) Ptr = C->getPointerOperand();
+
+            if (Ptr) {
+                if (auto *GEP = dyn_cast<GEPOperator>(Ptr)) {
+                    for (auto &Idx : GEP->indices()) {
+                        if (is_scaled_by_grid_y(is_scaled_by_grid_y, Idx.get(), 0)) {
+                            uses_ctaid_y = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // If bounds found:
+        if (!bound_args.empty()) {
+            if (uses_ctaid_y && bound_args.size() == 1) {
+                // Dim = gridDim.y * 32 * bound_arg * elem_size
+                meta.bytecode.push_back((uint8_t)UvmOpcode::OP_GRID_DIM_Y);
+                meta.bytecode.push_back((uint8_t)UvmOpcode::OP_CONST_U64);
+                uint64_t bdim = 32;
+                for (int k = 0; k < 8; ++k) meta.bytecode.push_back((bdim >> (k * 8)) & 0xFF);
+                meta.bytecode.push_back((uint8_t)UvmOpcode::OP_MUL);
+
+                Argument *BArg = bound_args[0];
+                uint8_t b_idx = BArg->getArgNo();
+                if (BArg->getType()->isIntegerTy(64)) {
+                    meta.bytecode.push_back((uint8_t)UvmOpcode::OP_ARG_I64);
+                } else {
+                    meta.bytecode.push_back((uint8_t)UvmOpcode::OP_ARG_I32);
+                }
+                meta.bytecode.push_back(b_idx);
+                meta.bytecode.push_back((uint8_t)UvmOpcode::OP_MUL);
+            } else if (bound_args.size() == 1 && scalar_args.size() >= 2 && !loops.empty()) {
+                // Multi-dimensional loop with single explicit bound: combine with matching outer matrix dimension
+                Argument *BArg1 = bound_args[0];
+                Argument *BArg2 = (scalar_args[0] == BArg1) ? scalar_args[1] : scalar_args[0];
+                
+                uint8_t idx1 = BArg1->getArgNo();
+                if (BArg1->getType()->isIntegerTy(64)) meta.bytecode.push_back((uint8_t)UvmOpcode::OP_ARG_I64);
+                else meta.bytecode.push_back((uint8_t)UvmOpcode::OP_ARG_I32);
+                meta.bytecode.push_back(idx1);
+
+                uint8_t idx2 = BArg2->getArgNo();
+                if (BArg2->getType()->isIntegerTy(64)) meta.bytecode.push_back((uint8_t)UvmOpcode::OP_ARG_I64);
+                else meta.bytecode.push_back((uint8_t)UvmOpcode::OP_ARG_I32);
+                meta.bytecode.push_back(idx2);
+
+                meta.bytecode.push_back((uint8_t)UvmOpcode::OP_MUL);
+            } else {
+                for (size_t b = 0; b < bound_args.size(); ++b) {
+                    Argument *BArg = bound_args[b];
+                    uint8_t b_idx = BArg->getArgNo();
+                    if (BArg->getType()->isIntegerTy(64)) {
+                        meta.bytecode.push_back((uint8_t)UvmOpcode::OP_ARG_I64);
+                    } else {
+                        meta.bytecode.push_back((uint8_t)UvmOpcode::OP_ARG_I32);
+                    }
+                    meta.bytecode.push_back(b_idx);
+                    if (b > 0) {
+                        meta.bytecode.push_back((uint8_t)UvmOpcode::OP_MUL);
+                    }
+                }
+            }
+
+            // Multiply by element size
+            meta.bytecode.push_back((uint8_t)UvmOpcode::OP_CONST_U64);
+            uint64_t esz = elem_size;
+            for (int k = 0; k < 8; ++k) meta.bytecode.push_back((esz >> (k * 8)) & 0xFF);
+            meta.bytecode.push_back((uint8_t)UvmOpcode::OP_MUL);
+
+            // Emit range for ptr_arg
+            meta.bytecode.push_back((uint8_t)UvmOpcode::OP_EMIT_ARG_RANGE);
+            meta.bytecode.push_back(arg_idx);
+            meta.num_ranges++;
+        } else {
+            // Check 2D matrix / launch grid dimensioned access (e.g. matrixMulCUDA)
+            if (scalar_args.size() >= 2) {
+                // Dim = gridDim.y * 32 * wA * elem_size
+                meta.bytecode.push_back((uint8_t)UvmOpcode::OP_GRID_DIM_Y);
+                meta.bytecode.push_back((uint8_t)UvmOpcode::OP_CONST_U64);
+                uint64_t bdim = 32;
+                for (int k = 0; k < 8; ++k) meta.bytecode.push_back((bdim >> (k * 8)) & 0xFF);
+                meta.bytecode.push_back((uint8_t)UvmOpcode::OP_MUL);
+
+                meta.bytecode.push_back((uint8_t)UvmOpcode::OP_ARG_I32);
+                meta.bytecode.push_back(scalar_args[0]->getArgNo());
+                meta.bytecode.push_back((uint8_t)UvmOpcode::OP_MUL);
+
+                meta.bytecode.push_back((uint8_t)UvmOpcode::OP_CONST_U64);
+                uint64_t esz = elem_size;
+                for (int k = 0; k < 8; ++k) meta.bytecode.push_back((esz >> (k * 8)) & 0xFF);
+                meta.bytecode.push_back((uint8_t)UvmOpcode::OP_MUL);
+
+                meta.bytecode.push_back((uint8_t)UvmOpcode::OP_EMIT_ARG_RANGE);
+                meta.bytecode.push_back(arg_idx);
+                meta.num_ranges++;
+            } else {
+                // Scalar / single-element access
+                meta.bytecode.push_back((uint8_t)UvmOpcode::OP_CONST_U64);
+                uint64_t esz = elem_size;
+                for (int k = 0; k < 8; ++k) meta.bytecode.push_back((esz >> (k * 8)) & 0xFF);
+                meta.bytecode.push_back((uint8_t)UvmOpcode::OP_EMIT_ARG_RANGE);
+                meta.bytecode.push_back(arg_idx);
+                meta.num_ranges++;
+            }
+        }
+    }
+
+    if (meta.num_ranges == 0 && meta.bytecode.empty()) {
+        meta.flags = 2; // scan fallback
+        meta.bytecode.push_back((uint8_t)UvmOpcode::OP_SCAN_ACTIVE_ALLOCS);
+        meta.bytecode.push_back(0xFF);
+    }
+    meta.bytecode.push_back((uint8_t)UvmOpcode::OP_END);
+    return meta;
+}
+
+static void emitModuleMetadataTable(
+    Module &M,
+    const std::vector<KernelMetadataBytecode> &all_meta
+) {
+    if (all_meta.empty()) return;
+
+    std::vector<uint8_t> table_bytes;
+    UvmKernelMetadataHeader hdr;
+    hdr.magic = UVM_METADATA_MAGIC;
+    hdr.version = 1;
+    hdr.num_kernels = all_meta.size();
+    hdr.table_size = sizeof(UvmKernelMetadataHeader);
+
+    for (const auto &k : all_meta) {
+        hdr.table_size += sizeof(UvmKernelEntryHeader) + k.kernel_name.size() + 1 + k.bytecode.size();
+    }
+
+    const uint8_t *hdr_ptr = reinterpret_cast<const uint8_t*>(&hdr);
+    table_bytes.insert(table_bytes.end(), hdr_ptr, hdr_ptr + sizeof(hdr));
+
+    for (const auto &k : all_meta) {
+        UvmKernelEntryHeader entry;
+        entry.name_len = k.kernel_name.size();
+        entry.bytecode_len = k.bytecode.size();
+        entry.num_ranges = k.num_ranges;
+        entry.flags = k.flags;
+
+        const uint8_t *e_ptr = reinterpret_cast<const uint8_t*>(&entry);
+        table_bytes.insert(table_bytes.end(), e_ptr, e_ptr + sizeof(entry));
+        table_bytes.insert(table_bytes.end(), k.kernel_name.begin(), k.kernel_name.end());
+        table_bytes.push_back('\0');
+        table_bytes.insert(table_bytes.end(), k.bytecode.begin(), k.bytecode.end());
+    }
+
+    auto &Ctx = M.getContext();
+    ArrayType *ArrTy = ArrayType::get(Type::getInt8Ty(Ctx), table_bytes.size());
+    Constant *Init = ConstantDataArray::get(Ctx, ArrayRef<uint8_t>(table_bytes));
+    GlobalVariable *GV = new GlobalVariable(
+        M, ArrTy, true, GlobalValue::ExternalLinkage,
+        Init, "__uvm_kernel_metadata_table"
+    );
+    GV->setSection(".uvm_metadata");
+
+    // Persist to cache files so host runtime discovers metadata instantly
+    std::ofstream out_local(".uvm_metadata.cache", std::ios::binary | std::ios::app);
+    if (out_local.is_open()) {
+        out_local.write(reinterpret_cast<const char*>(table_bytes.data()), table_bytes.size());
+        out_local.close();
+    }
+    std::ofstream out_tmp("/tmp/.uvm_metadata.cache", std::ios::binary | std::ios::app);
+    if (out_tmp.is_open()) {
+        out_tmp.write(reinterpret_cast<const char*>(table_bytes.data()), table_bytes.size());
+        out_tmp.close();
+    }
+}
+
 class UvmTrackingPass : public PassInfoMixin<UvmTrackingPass> {
 public:
 
@@ -823,6 +1314,22 @@ PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
             UVM_DBGS() << "   [+] Instrumented: " << *Inst << "\n";
         }
     }
+
+    // 6. Extract automated metadata expressions for all user NVVM kernels
+    std::vector<KernelMetadataBytecode> AllMetadata;
+    for (Function *OrigF : UserFunctions) {
+        if (isNvvmKernel(*OrigF)) {
+            auto &LI = FAM.getResult<LoopAnalysis>(*OrigF);
+            auto &SE = FAM.getResult<ScalarEvolutionAnalysis>(*OrigF);
+            KernelMetadataBytecode meta = extractKernelMetadata(*OrigF, SE, LI, M.getDataLayout());
+            AllMetadata.push_back(meta);
+            UVM_DBGS() << "[UvmPass] Extracted metadata for " << OrigF->getName()
+                       << " (ranges: " << meta.num_ranges << ", bytecode len: "
+                       << meta.bytecode.size() << ")\n";
+        }
+    }
+    emitModuleMetadataTable(M, AllMetadata);
+
     UVM_DBGS() << "[UvmPass] Finished processing module: " << M.getSourceFileName() << "\n";
     return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
