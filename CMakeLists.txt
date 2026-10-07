@@ -2,9 +2,13 @@ cmake_minimum_required(VERSION 3.15)
 project(UvmTracker)
 
 # Force use of LLVM 20
-set(LLVM_DIR /usr/lib/llvm-20/lib/cmake/llvm)
+if(EXISTS "/home/arush/data/ravi/llvm-20/usr/lib/llvm-20/lib/cmake/llvm")
+    set(LLVM_DIR /home/arush/data/ravi/llvm-20/usr/lib/llvm-20/lib/cmake/llvm)
+else()
+    set(LLVM_DIR /usr/lib/llvm-20/lib/cmake/llvm)
+endif()
 set(CMAKE_CXX_COMPILER "clang++-20")
-set(CMAKE_C_COMPILER "clang-20")
+set(CMAKE_C_COMPILER "gcc")
 
 # 1. Find the pre-installed LLVM
 find_package(LLVM REQUIRED CONFIG)
