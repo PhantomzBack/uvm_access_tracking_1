@@ -249,13 +249,18 @@ int main(int argc, char *argv[])
 
 	t_after_array_init = rtclock();
 	GPU_argv_init();
-	#ifdef TRACKING
+	#ifdef TRACKING_ENABLED
 	void*** d_l1;
 	init_tracking(&d_l1);
 	#endif
 	//Warmup
 	
 	gramschmidtCuda(A_gpu, R_gpu, Q_gpu);
+	
+	#ifdef TRACKING_ENABLED
+	export_binary(d_l1, "access_log.bin");
+	cudaFree(d_l1);
+	#endif
 	
 	// if (compare_with_cpu) {
 	// 	t_start = rtclock();

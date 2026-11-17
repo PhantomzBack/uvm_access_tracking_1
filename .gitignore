@@ -21,3 +21,4 @@ pagelog_test_results/**
 *_results/**
 results/**
 __pycache__/
+temporal_*.json

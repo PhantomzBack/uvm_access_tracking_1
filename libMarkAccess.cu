@@ -2,6 +2,7 @@
 #include "tracking.h"
 #include "uvm_control_thread.h"
 #include <mutex>
+#include <dlfcn.h>
 
 #ifdef IGNORE_NON_GLOBAL
 #pragma message("MarkAccess: IGNORE_NON_GLOBAL is defined, non-global accesses will be ignored")
@@ -36,6 +37,7 @@ __device__ inline unsigned int my_match_any_sync(unsigned int mask, int value) {
 // ── Host-accessible globals for LD_PRELOAD wrapper ────────────────────────────
 extern "C" void** g_uvm_shadow_l1 = nullptr;
 extern "C" int    g_uvm_tracking_enabled_host = 1;
+static UvmTripwireMailbox* g_host_tripwire_mailbox = nullptr;
 
 // ── Device globals ────────────────────────────────────────────────────────────
 extern "C" {
@@ -45,6 +47,60 @@ extern "C" {
     // Runtime-toggled constants (set from host via cudaMemcpyToSymbol)
     __constant__ int g_tracking_enabled = 1;
     __constant__ int g_skip_on_miss     = 0;
+
+    // ── Temporal Tracking Device Storage & Function ───────────────────────────
+    __device__ TemporalMilestoneEntry g_temporal_log[MAX_TEMPORAL_ENTRIES];
+    __device__ unsigned int g_temporal_head = 0;
+    __device__ int g_temporal_enabled = 1;
+    __device__ UvmTripwireMailbox* g_device_tripwire_mailbox = nullptr;
+
+    __device__ void uvm_record_temporal_milestone(
+        uint32_t kernel_id,
+        uint32_t milestone_id,
+        uintptr_t base_addr,
+        uint32_t size_bytes,
+        uint32_t flags
+    ) {
+        if (!g_temporal_enabled) return;
+        // Reordered: Check blockIdx FIRST!
+        // blockIdx is uniform across ALL 32 threads in a warp. For all blocks > 0,
+        // every thread evaluates to TRUE uniformly, taking the return branch together
+        // with ZERO warp divergence on the uniform datapath.
+        // Checking threadIdx first caused Warp 0 in EVERY block (1..N-1) to diverge!
+        if ((blockIdx.x | blockIdx.y | blockIdx.z) != 0) return;
+        // Only Block 0 reaches here; now isolate Thread 0
+        if ((threadIdx.x | threadIdx.y | threadIdx.z) != 0) return;
+
+        // For fine-grained unit-stride scalar loops (milestone_id = 0, 1, 2, ... up to thousands),
+        // subsample after the first 32 iterations to every 128th iteration so we capture sub-kernel
+        // page slices without stalling on thousands of PCIe system-coherent stores per launch.
+        if (flags == 0 && milestone_id >= 32 && milestone_id < 65536 && (milestone_id & 127) != 0) return;
+
+        uint64_t t;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+
+        unsigned int idx = atomicAdd(&g_temporal_head, 1);
+        if (idx < MAX_TEMPORAL_ENTRIES) {
+            g_temporal_log[idx].kernel_id = kernel_id;
+            g_temporal_log[idx].milestone_id = milestone_id;
+            g_temporal_log[idx].timestamp_ns = t;
+            g_temporal_log[idx].base_addr = (uint64_t)base_addr;
+            g_temporal_log[idx].size_bytes = size_bytes;
+            g_temporal_log[idx].block_id = 0;
+            g_temporal_log[idx].flags = (uint16_t)flags;
+        }
+        if (g_device_tripwire_mailbox) {
+            g_device_tripwire_mailbox->kernel_id = kernel_id;
+            g_device_tripwire_mailbox->milestone_id = milestone_id;
+            g_device_tripwire_mailbox->flags = flags;
+            g_device_tripwire_mailbox->gpu_ts_ns = t;
+            g_device_tripwire_mailbox->base_addr = (uint64_t)base_addr;
+            g_device_tripwire_mailbox->size_bytes = size_bytes;
+            uint32_t seq = idx + 1;
+            asm volatile("st.global.release.sys.u32 [%0], %1;"
+                         :: "l"(&g_device_tripwire_mailbox->seq_num), "r"(seq));
+        }
+    }
 
     // ── Helper: mark a single page (used by BatchMarkAccess) ─────────────────
     __device__ __forceinline__ void
@@ -406,6 +462,16 @@ void init_tracking(void**** d_l1_ptr)
     }
 
     g_uvm_shadow_l1 = (void**)temp;
+    if (!g_host_tripwire_mailbox) {
+        cudaError_t merr = cudaHostAlloc((void**)&g_host_tripwire_mailbox, sizeof(UvmTripwireMailbox), cudaHostAllocMapped);
+        if (merr == cudaSuccess && g_host_tripwire_mailbox) {
+            memset((void*)g_host_tripwire_mailbox, 0, sizeof(UvmTripwireMailbox));
+            UvmTripwireMailbox* dev_mb = nullptr;
+            if (cudaHostGetDevicePointer((void**)&dev_mb, (void*)g_host_tripwire_mailbox, 0) == cudaSuccess) {
+                cudaMemcpyToSymbol(g_device_tripwire_mailbox, &dev_mb, sizeof(UvmTripwireMailbox*));
+            }
+        }
+    }
     CUDA_CHECK(cudaDeviceSynchronize());
 
 #ifndef UVM_NO_CONTROL_THREAD
@@ -855,4 +921,123 @@ void export_binary(void*** d_l1, const char* filename)
         f.write(reinterpret_cast<char*>(leaf.data.data()), L3_BYTES);
 
     LOG("[export_binary] done — %zu bytes written\n", (size_t)off);
+
+    // Auto-dump temporal log if entries were recorded
+    uint32_t temp_cnt = uvm_temporal_get_count();
+    if (temp_cnt > 0) {
+        uvm_temporal_export_json("temporal_log.json");
+        const char* st_env = getenv("UVM_STATIC_TRIPWIRE");
+        if (st_env && st_env[0] == '1') {
+            auto export_static_fn = (void (*)(const char*))dlsym(RTLD_DEFAULT, "uvm_export_static_temporal_trace");
+            if (export_static_fn) {
+                const char* st_out = getenv("UVM_STATIC_TEMPORAL_OUTPUT");
+                if (!st_out) st_out = "temporal_host_trace.json";
+                export_static_fn(st_out);
+            }
+        }
+    }
 }
+
+// ── Host-side Temporal Log Management & Export ───────────────────────────────
+extern "C" void uvm_temporal_reset(void) {
+    unsigned int zero = 0;
+    cudaMemcpyToSymbol(g_temporal_head, &zero, sizeof(unsigned int));
+    if (g_host_tripwire_mailbox) {
+        memset((void*)g_host_tripwire_mailbox, 0, sizeof(UvmTripwireMailbox));
+    }
+}
+
+extern "C" UvmTripwireMailbox* uvm_get_tripwire_mailbox(void) {
+    return g_host_tripwire_mailbox;
+}
+
+extern "C" uint32_t uvm_temporal_copy_entries(TemporalMilestoneEntry *out_entries, uint32_t max_entries) {
+    uint32_t count = uvm_temporal_get_count();
+    if (count > max_entries) count = max_entries;
+    if (count > 0 && out_entries) {
+        cudaMemcpyFromSymbol(out_entries, g_temporal_log, count * sizeof(TemporalMilestoneEntry));
+    }
+    return count;
+}
+
+extern "C" uint32_t uvm_temporal_get_count(void) {
+    unsigned int count = 0;
+    cudaMemcpyFromSymbol(&count, g_temporal_head, sizeof(unsigned int));
+    if (count > MAX_TEMPORAL_ENTRIES) count = MAX_TEMPORAL_ENTRIES;
+    return count;
+}
+
+extern "C" void uvm_temporal_set_enabled(int enabled) {
+    cudaMemcpyToSymbol(g_temporal_enabled, &enabled, sizeof(int));
+}
+
+extern "C" void uvm_temporal_export_json(const char *filename) {
+    uint32_t count = uvm_temporal_get_count();
+    if (count == 0) {
+        printf("[uvm_temporal] No temporal entries recorded.\n");
+        return;
+    }
+    std::vector<TemporalMilestoneEntry> entries(count);
+    cudaMemcpyFromSymbol(entries.data(), g_temporal_log, count * sizeof(TemporalMilestoneEntry));
+
+    FILE *f = fopen(filename, "w");
+    if (!f) {
+        fprintf(stderr, "[uvm_temporal] Failed to open %s for writing\n", filename);
+        return;
+    }
+    uint64_t t0 = entries[0].timestamp_ns;
+    fprintf(f, "{\n  \"count\": %u,\n  \"entries\": [\n", count);
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto &e = entries[i];
+        double rel_us = (double)(e.timestamp_ns - t0) / 1000.0;
+        fprintf(f, "    {\"kernel_id\": %u, \"milestone_id\": %u, \"timestamp_ns\": %llu, "
+                   "\"rel_time_us\": %.3f, \"base_addr\": \"0x%llx\", \"size_bytes\": %u, "
+                   "\"block_id\": %u, \"flags\": %u}%s\n",
+                e.kernel_id, e.milestone_id, (unsigned long long)e.timestamp_ns,
+                rel_us, (unsigned long long)e.base_addr, e.size_bytes, e.block_id,
+                e.flags, (i + 1 < count) ? "," : "");
+    }
+    fprintf(f, "  ]\n}\n");
+    fclose(f);
+    printf("[uvm_temporal] Exported %u temporal milestones to %s\n", count, filename);
+}
+
+extern "C" void uvm_temporal_export_csv(const char *filename) {
+    uint32_t count = uvm_temporal_get_count();
+    if (count == 0) {
+        printf("[uvm_temporal] No temporal entries recorded.\n");
+        return;
+    }
+    std::vector<TemporalMilestoneEntry> entries(count);
+    cudaMemcpyFromSymbol(entries.data(), g_temporal_log, count * sizeof(TemporalMilestoneEntry));
+
+    FILE *f = fopen(filename, "w");
+    if (!f) {
+        fprintf(stderr, "[uvm_temporal] Failed to open %s for writing\n", filename);
+        return;
+    }
+    fprintf(f, "kernel_id,milestone_id,timestamp_ns,rel_time_us,base_addr,size_bytes,block_id,flags\n");
+    uint64_t t0 = entries[0].timestamp_ns;
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto &e = entries[i];
+        double rel_us = (double)(e.timestamp_ns - t0) / 1000.0;
+        fprintf(f, "%u,%u,%llu,%.3f,0x%llx,%u,%u,%u\n",
+                e.kernel_id, e.milestone_id, (unsigned long long)e.timestamp_ns,
+                rel_us, (unsigned long long)e.base_addr, e.size_bytes, e.block_id, e.flags);
+    }
+    fclose(f);
+    printf("[uvm_temporal] Exported %u temporal milestones to %s\n", count, filename);
+}
+
+__attribute__((destructor)) static void uvm_temporal_auto_export() {
+    uint32_t count = uvm_temporal_get_count();
+    if (count > 0) {
+        const char *out = getenv("UVM_TEMPORAL_OUTPUT");
+        if (!out) out = "temporal_log.json";
+        if (std::string(out) != "0") {
+            uvm_temporal_export_json(out);
+        }
+    }
+}
+
+

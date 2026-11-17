@@ -51,11 +51,12 @@ enum class UvmOpcode : uint8_t {
     OP_MIN                = 0x36,
 
     // Emission
-    OP_EMIT_RANGE         = 0x40, // pop size, pop base
-    OP_EMIT_ARG_RANGE     = 0x41, // [uint8_t ptr_arg_idx], pop size
+    OP_EMIT_RANGE            = 0x40, // pop size, pop base
+    OP_EMIT_ARG_RANGE        = 0x41, // [uint8_t ptr_arg_idx], pop size
+    OP_EMIT_STRUCT_ARG_RANGE = 0x42, // [uint8_t struct_arg_idx, uint8_t byte_offset], pop size
 
     // Active allocation scan fallback (for templated/aggregate kernel args)
-    OP_SCAN_ACTIVE_ALLOCS = 0x50  // [uint8_t ptr_arg_idx] (0xFF = scan args[0])
+    OP_SCAN_ACTIVE_ALLOCS    = 0x50  // [uint8_t ptr_arg_idx] (0xFF = scan args[0])
 };
 
 // ── Binary Metadata Format for ELF / Module ─────────────────────────────────
@@ -96,6 +97,7 @@ struct KernelPolicyDescriptor {
     FootprintPredictorFunc predictor_fn = nullptr;
     std::vector<uint8_t> bytecode;
     uint64_t launch_count = 0;
+    int num_args = -1;
 };
 
 // ── External Runtime APIs ───────────────────────────────────────────────────
